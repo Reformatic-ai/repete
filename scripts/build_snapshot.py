@@ -69,7 +69,7 @@ _INDEX_PAGES = {
     "sp600": "https://en.wikipedia.org/wiki/List_of_S%26P_600_companies",
 }
 _UA = {"User-Agent": "repete-research/1.0 "
-                     "(github.com/connorshibley/repete)"}
+                     "(github.com/Reformatic-ai/repete)"}
 
 
 def index_constituents(which: str = "sp1500") -> list:

@@ -1397,7 +1397,7 @@ x_posting:                # despite the name, this section is the BLOG + JOURNAL
   posts_log_path: memory/posts.jsonl   # append-only archive of every post the bot
                                        # writes -> rendered into the public blog,
                                        # whatever became of it on X
-  journal_url_base: https://connorshibley.github.io/repete-dashboard/journal.html
+  journal_url_base: https://reformatic-ai.github.io/repete-dashboard/journal.html
                        # public journal page. Each trade's write-up is anchored
                        # at #<trade_id>, which is what a post links to when X
                        # is on. Said "trade tweets link to" until 2026-07-29 —

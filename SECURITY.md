@@ -7,7 +7,7 @@ when it should not.
 
 ## Reporting a vulnerability
 
-Open a [GitHub security advisory](https://github.com/connorshibley/repete/security/advisories/new).
+Open a [GitHub security advisory](https://github.com/Reformatic-ai/repete/security/advisories/new).
 Please do not open a public issue for anything credential-related.
 
 Sole maintainer, best-effort response. There is no SLA and it would be dishonest
