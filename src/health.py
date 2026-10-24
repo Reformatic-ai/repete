@@ -277,6 +277,13 @@ def status(cfg: dict | None = None, now: datetime | None = None,
         # has never tripped in production, which is exactly why it has been
         # invisible. Populated from `risk.drawdown_state`, read-only.
         "drawdown": None,
+        # The operator's console settings as the NEXT cycle will read them
+        # (operator_settings.py): version, cost per trade, frequency, the
+        # simulated cost charged so far, and `problem` when the file is missing
+        # or ignored. Reported, NOT a health problem: no file means "nothing set
+        # yet" (no cost, medium frequency), which is how the bot ran before the
+        # console had settings, and must not flip the container unhealthy.
+        "operator_settings": None,
         "problems": [],
     }
 
@@ -368,6 +375,23 @@ def status(cfg: dict | None = None, now: datetime | None = None,
             last_equity, (cfg.get("risk") or {}).get("max_drawdown_pct", 0))
     except Exception as e:  # noqa: BLE001 — health must never crash
         out["problems"].append(f"drawdown state unreadable: {e}")
+
+    try:
+        import operator_settings
+        op_dir = statepaths.operator_dir(cfg)
+        op = operator_settings.load(op_dir)
+        out["operator_settings"] = {
+            "version": op.version,
+            "fee_per_trade": op.fee_per_trade,
+            "fee_on_crypto": op.fee_on_crypto,
+            "fee_on_fx": op.fee_on_fx,
+            "frequency": op.frequency,
+            "updated_at": op.updated_at,
+            "fees_charged_total": operator_settings.total(op_dir),
+            "problem": op.problem or None,
+        }
+    except Exception as e:  # noqa: BLE001 — health must never crash
+        out["operator_settings"] = {"problem": f"operator settings check failed: {e}"}
 
     if out["halted"]:
         out["problems"].append("HALT file present — trading disabled")
@@ -488,6 +512,10 @@ def main() -> int:
             alerts_txt = f" | alerts={alerting.channel()}"
         except Exception:  # noqa: BLE001 — monitoring never breaks the report
             alerts_txt = ""
+        op = s.get("operator_settings") or {}
+        op_txt = (f" | operator=v{op['version']} ${op['fee_per_trade']:.2f}/trade"
+                  f" {op['frequency']} (charged ${op['fees_charged_total']:.2f})"
+                  if "version" in op else "")
         print(f"{'HEALTHY' if s['healthy'] else 'DEGRADED'} | mode={s['mode']}"
               f" | storage={s['storage_backend']}"
               f" | heartbeat={s['heartbeat_age_hours']}h"
@@ -495,9 +523,12 @@ def main() -> int:
               f" | open={s['open_positions']}"
               f"{dd_txt}"
               f"{alerts_txt}"
+              f"{op_txt}"
               f" | degradations today={s['degradations_today']}")
         for p in s["problems"]:
             print(f"  - {p}")
+        if op.get("problem"):
+            print(f"  (operator settings: {op['problem']})")
     return 0 if s["healthy"] else 1
 
 

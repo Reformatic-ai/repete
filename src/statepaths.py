@@ -85,6 +85,23 @@ def halt_path(cfg: dict | None) -> str:
     return _memory(cfg).get("halt_path") or DEFAULT_HALT_PATH
 
 
+DEFAULT_OPERATOR_DIR = "memory"
+
+
+def operator_dir(cfg: dict | None = None) -> str:
+    """The directory holding the operator's settings and the simulated-fee log
+    (`operator_settings.json`, `operator_fees.jsonl` — see operator_settings.py).
+
+    The console host writes the settings into this bot's `memory/` (mounted at
+    /app/memory in the container; config.yaml is baked into the image, so the
+    settings cannot live there). `REPETE_OPERATOR_DIR` overrides it, and the test
+    suite sets it so no test can read the live settings or append a fake fee to
+    the live fee log. Never raises, never touches the filesystem.
+    """
+    return (os.environ.get("REPETE_OPERATOR_DIR")
+            or _memory(cfg).get("operator_dir") or DEFAULT_OPERATOR_DIR)
+
+
 def ensure_parent(path: str) -> None:
     """mkdir the parent, for WRITERS ONLY.
 

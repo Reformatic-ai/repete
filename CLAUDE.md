@@ -91,6 +91,17 @@ src/store.py     Event-store backend behind one 2-method interface (2026-07-22, 
 src/health.py    One status object (heartbeat age, HALT, degradations today, slo_breach,
                  backend, open positions) for the watchdog, container HEALTHCHECK and a
                  future status page. Read-only.
+src/operator_settings.py Operator settings from the Reformatic console (2026-10-24):
+                 memory/operator_settings.json (written by the console host, read once
+                 per cycle in _bootstrap_cycle). A flat SIMULATED cost per trade,
+                 appended per filled order to memory/operator_fees.jsonl under the
+                 console exporter's key (buy:<trade_id> where the fill is confirmed in
+                 record_fill_quality or on adoption; close:<trade_id> in handle_close)
+                 — never touches an order, cash, equity, P&L, sizing or any rail, and
+                 is NOT a fill cost (not in the backtester). And a trade frequency:
+                 low/high adjust three entry knobs via apply_frequency; medium returns
+                 config.yaml's values untouched. Missing/bad file = no cost, medium;
+                 reported in health.py's `operator_settings`, never as a problem.
 src/disclaimer.py Single source of the paper-trading/not-advice disclaimer (2026-07-22).
                  Dashboard, journal, blog footers render it; publisher/gates.py
                  re-exports it. Edit the text HERE only.
