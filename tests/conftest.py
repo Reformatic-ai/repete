@@ -115,6 +115,20 @@ def _no_real_offhost_backups(monkeypatch, tmp_path_factory):
         monkeypatch.delenv(key)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_operator_state(monkeypatch, tmp_path_factory):
+    """No test may read the live operator settings or append to the live fee log.
+
+    The console writes `memory/operator_settings.json` on the host the bot runs
+    on, and the suite is run from that same checkout: without this, a test that
+    closes a trade would charge a fake fee into the real `operator_fees.jsonl`,
+    which the console subtracts from the equity it shows. Tests that exercise
+    the fee path point it at their own directory.
+    """
+    monkeypatch.setenv("REPETE_OPERATOR_DIR",
+                       str(tmp_path_factory.mktemp("operator")))
+
+
 @pytest.fixture
 def cfg(tmp_path):
     """Minimal dict config mirroring config.yaml, network layers disabled.

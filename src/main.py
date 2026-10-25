@@ -29,6 +29,7 @@ import datacheck
 import flatten_recovery
 import trade_plan
 import modelver
+import operator_settings
 import postexit
 import preflight
 import regime as regime_mod
@@ -87,6 +88,40 @@ def configure_logging() -> None:
     structlog.redact_existing_handlers()
 
 
+def _charge_operator_fee(cfg: dict | None, ref: str, symbol: str, side: str,
+                         ts: str | None = None) -> float:
+    """Charge the operator's SIMULATED cost per trade for one filled order.
+
+    Appends to memory/operator_fees.jsonl (operator_settings.charge) and nothing
+    else: no order, cash, equity, sizing or rail sees it — the console subtracts
+    the running total from the equity it shows. `ref` is the console exporter's
+    transaction key for this order: "buy:<trade_id>" for a filled entry,
+    "close:<trade_id>" for its close. Idempotent on ref. Uses the settings this
+    cycle loaded in _bootstrap_cycle; a cfg without them charges nothing.
+    Never raises: bookkeeping must not cost a trade.
+    """
+    settings = operator_settings.from_cfg(cfg)
+    if settings is None:
+        return 0.0
+    try:
+        when = None
+        if ts:
+            when = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+        fee = operator_settings.charge(
+            statepaths.operator_dir(cfg), settings, ref=ref,
+            market=operator_settings.MARKET, symbol=symbol, side=side,
+            currency=operator_settings.CURRENCY, ts=when)
+        if fee:
+            log.info("operator cost $%.2f charged on %s (%s %s, settings v%s)",
+                     fee, ref, side, symbol, settings.version)
+        return fee
+    except Exception as e:  # noqa: BLE001 — never block the trade it describes
+        log.error("operator cost for %s not recorded: %s", ref, e)
+        return 0.0
+
+
 def handle_close(trade_id: str, open_rec: dict, exit_price: float,
                  ledger: Ledger, memory: Memory, cfg: dict,
                  exit_reason: str = "strategy_sell",
@@ -129,6 +164,11 @@ def handle_close(trade_id: str, open_rec: dict, exit_price: float,
 
     ledger.close_trade(trade_id, exit_price, pnl, pnl_pct,
                        exit_reason=exit_reason, benchmark_pnl_pct=bench_pct)
+    # The closing order pays the operator's simulated cost (its exporter row is
+    # "close:<trade_id>"). Not part of pnl above: the outcome record stays the
+    # strategy's result, and the console nets the cost off displayed equity.
+    _charge_operator_fee(cfg, f"close:{trade_id}", open_rec.get("symbol") or "",
+                         "cover" if open_rec.get("action") == "short" else "sell")
     if bench_pct is None:
         log.info("Closed trade %s (%s): P&L $%.2f (%.2f%%)",
                  trade_id, exit_reason, pnl, pnl_pct)
@@ -489,6 +529,11 @@ def adopt_untracked_positions(broker, ledger: Ledger, cfg: dict,
             ledger.log_event("position_adopted",
                              f"{symbol}: qty {qty} @ {float(entry):.2f} "
                              f"(trade {tid})")
+            # A held position is a confirmed fill, and the console shows an
+            # adopted buy as "buy:<tid>". It never gets a fill_quality row (no
+            # order id), so this is where its entry pays the operator cost.
+            if action == "buy":
+                _charge_operator_fee(cfg, f"buy:{tid}", symbol, "buy", fill_ts)
             log.warning("Adopted untracked %s position: qty %d @ $%.2f "
                         "(trade %s) — an entry filled but its ledger write was "
                         "lost", symbol, qty, float(entry), tid)
@@ -584,14 +629,24 @@ def write_heartbeat(cfg: dict | None = None):
         log.warning("heartbeat write failed: %s", e)
 
 
-def record_fill_quality(broker, ledger: Ledger, max_checks: int = 20):
+def record_fill_quality(broker, ledger: Ledger, max_checks: int = 20,
+                        cfg: dict | None = None):
     """Measured slippage: the price the signal saw vs the broker's actual
     fill, appended once per trade as a fill_quality record. GUIDE §9's
     go-live comparison should use measured costs, not estimates.
-    Bounded, idempotent, never raises."""
+    Bounded, idempotent, never raises.
+
+    Also where a BUY entry pays the operator's simulated cost: this is the
+    first point the fill is CONFIRMED, so an entry that never fills (written
+    off as entry_unfilled — the console shows no row for it) is never charged.
+    A written-off entry that fills late anyway is skipped here too: its
+    position comes back as an adopted trade, which pays under its own id."""
     try:
         records = ledger.all_records()
         have = {r["trade_id"] for r in records if r["type"] == "fill_quality"}
+        unfilled = {r.get("trade_id") for r in records
+                    if r["type"] == "outcome"
+                    and r.get("exit_reason") == "entry_unfilled"}
         candidates = [r for r in records
                       if r["type"] == "decision" and r.get("executed")
                       and (r.get("order") or {}).get("id")
@@ -621,6 +676,9 @@ def record_fill_quality(broker, ledger: Ledger, max_checks: int = 20):
             bps = sign * (fill - signal) / signal * 1e4
             ledger.log_fill_quality(rec["trade_id"], rec["symbol"],
                                     rec["action"], signal, fill, bps)
+            if rec["action"] == "buy" and rec["trade_id"] not in unfilled:
+                _charge_operator_fee(cfg, f"buy:{rec['trade_id']}",
+                                     rec["symbol"], "buy", o.get("filled_at"))
     except Exception as e:  # noqa: BLE001 — instrumentation never kills a cycle
         log.error("fill-quality pass failed: %s", e)
 
@@ -889,6 +947,16 @@ def _bootstrap_cycle():
     load_dotenv()
     with open("config.yaml") as f:
         cfg = yaml.safe_load(f)
+
+    # The operator's settings (console -> memory/operator_settings.json), read
+    # fresh every cycle so a change applies from the next trade on. Frequency
+    # adjusts the cycle's config BEFORE preflight, so the rails validate the
+    # values that will actually trade; medium returns cfg untouched. A missing
+    # or bad file is no cost + medium (the reason is in health.py's output).
+    opset = operator_settings.load(statepaths.operator_dir(cfg))
+    cfg = operator_settings.to_cfg(
+        operator_settings.apply_frequency(cfg, opset), opset)
+    log.info("Operator settings: %s", opset.summary())
 
     # Pre-flight: a misconfigured system FAILS SAFE (opposite polarity from
     # data outages, which degrade gracefully). Nothing trades past this.
@@ -1455,11 +1523,26 @@ def _rail_census_safe(action, symbol, qty, price, account, positions, cfg,
         return None
 
 
+def _log_operator_settings(ledger: Ledger, cfg: dict) -> None:
+    """One `operator_settings` ledger event per cycle: the frequency and cost in
+    effect, and why the file was ignored if it was. Never raises."""
+    try:
+        s = operator_settings.from_cfg(cfg) or operator_settings.OperatorSettings(
+            problem="operator settings not loaded")
+        ledger.log_event("operator_settings", s.summary()[:500])
+    except Exception as e:  # noqa: BLE001 — observability never blocks a cycle
+        log.warning("operator settings event not written: %s", e)
+
+
 def _run_cycle(completed_bars_only: bool = False):
     started = _bootstrap_cycle()
     if started is None:
         return
     cfg, ledger, memory, broker, account, positions, halted = started
+
+    # Once per CYCLE, not per bootstrap: swing_scan bootstraps every 30 minutes
+    # and keeps "nothing happened" out of the ledger on purpose.
+    _log_operator_settings(ledger, cfg)
 
     # --- DIVERGENCE #11: ratchet the equity peak ONCE PER CYCLE ---
     #
@@ -1503,7 +1586,7 @@ def _run_cycle(completed_bars_only: bool = False):
     # crash between order submit and the ledger write — adopt it so it is
     # tracked before we read open trades below.
     adopt_untracked_positions(broker, ledger, cfg, positions)
-    record_fill_quality(broker, ledger)
+    record_fill_quality(broker, ledger, cfg=cfg)
 
     open_trades = ledger.open_buys()    # trade_id -> record, for closing P&L
     # Before anything reads a stop off these records (the heat cap, the exit

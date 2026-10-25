@@ -85,6 +85,9 @@ EXEMPT = {
         "raising elsewhere so a stray call is a failure not a fallback",
     ("tests/test_main_cycle.py", "BreachedEmptyBook"):
         "same kill-switch path with an empty book",
+    ("tests/test_operator_settings.py", "_StopOutBroker"):
+        "drives reconcile_closed_positions alone to prove a stop-out pays the "
+        "operator cost and an unfilled entry does not; no cycle, no entry path",
     ("tests/test_reconcile.py", "FakeBroker"):
         "reconciliation reads orders only; no cycle, no entry path",
     ("tests/test_reconcile.py", "ExplodingBroker"):
