@@ -278,11 +278,13 @@ def status(cfg: dict | None = None, now: datetime | None = None,
         # invisible. Populated from `risk.drawdown_state`, read-only.
         "drawdown": None,
         # The operator's console settings as the NEXT cycle will read them
-        # (operator_settings.py): version, cost per trade, frequency, the
-        # simulated cost charged so far, and `problem` when the file is missing
-        # or ignored. Reported, NOT a health problem: no file means "nothing set
-        # yet" (no cost, medium frequency), which is how the bot ran before the
-        # console had settings, and must not flip the container unhealthy.
+        # (operator_settings.py): version, settings schema, this bot's cost
+        # model as one line (`cost`, cost_models.describe) plus the schema-1
+        # view (fee_per_trade/fee_on_*), frequency, the simulated cost charged
+        # so far, and `problem` when the file is missing or ignored. Reported,
+        # NOT a health problem: no file means "nothing set yet" (every market
+        # off, medium frequency), which is how the bot ran before the console
+        # had settings, and must not flip the container unhealthy.
         "operator_settings": None,
         "problems": [],
     }
@@ -382,6 +384,9 @@ def status(cfg: dict | None = None, now: datetime | None = None,
         op = operator_settings.load(op_dir)
         out["operator_settings"] = {
             "version": op.version,
+            "schema": op.schema,
+            "market": operator_settings.MARKET,
+            "cost": op.describe(),
             "fee_per_trade": op.fee_per_trade,
             "fee_on_crypto": op.fee_on_crypto,
             "fee_on_fx": op.fee_on_fx,
@@ -513,8 +518,9 @@ def main() -> int:
         except Exception:  # noqa: BLE001 — monitoring never breaks the report
             alerts_txt = ""
         op = s.get("operator_settings") or {}
-        op_txt = (f" | operator=v{op['version']} ${op['fee_per_trade']:.2f}/trade"
-                  f" {op['frequency']} (charged ${op['fees_charged_total']:.2f})"
+        op_txt = (f" | operator=v{op['version']} schema={op.get('schema')}"
+                  f" cost=({op.get('cost')}) {op['frequency']}"
+                  f" (charged ${op['fees_charged_total']:.2f})"
                   if "version" in op else "")
         print(f"{'HEALTHY' if s['healthy'] else 'DEGRADED'} | mode={s['mode']}"
               f" | storage={s['storage_backend']}"

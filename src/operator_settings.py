@@ -1,4 +1,4 @@
-"""Operator trading settings: a flat cost per trade and a trade frequency.
+"""Operator trading settings: a cost model per market and a trade frequency.
 
 Set by Peter (or the Reformatic operator) on the console's /trading page. The console
 host writes them to a JSON file in this bot's state directory (`memory/`, see
@@ -7,8 +7,23 @@ host writes them to a JSON file in this bot's state directory (`memory/`, see
 reads the file at the start of every cycle (`main._bootstrap_cycle`), so a change
 takes effect at the next trade and never rewrites past ones.
 
-    {"version": 3, "fee_per_trade": 9.0, "fee_on_crypto": false, "fee_on_fx": false,
-     "frequency": "medium", "updated_at": "2026-10-24T14:00:00Z"}
+    {"schema": 2, "version": 4, "frequency": "medium",
+     "updated_at": "2026-10-28T14:00:00Z",
+     "costs": {"equities": {"model": "per_share", "flat_per_order": 1.0,
+                            "per_share": 0.005, "min_per_order": 1.0,
+                            "max_pct_of_value": 1.0},
+               "options": {...}, "fx": {...}, "crypto": {...}},
+     "fee_per_trade": 1.0, "fee_on_crypto": false, "fee_on_fx": false}
+
+THE COST MODELS (settings schema 2, 2026-10-27) live in `cost_models.py`, a verbatim
+copy of the console's reformatic/trading/costs.py so the formulas never diverge.
+This bot trades equities, so it charges the `equities` model: per_share (US$0.005 a
+share, at least US$1.00 an order, at most 1% of the order's value), `flat` or `off`.
+A schema-1 file (only `fee_per_trade`, `fee_on_crypto`, `fee_on_fx`) still loads:
+`cost_models.from_settings` turns it into flat models that charge exactly what
+schema 1 charged, and a schema-2 file whose `costs` fail to validate falls back to
+those flat fields with `problem` set. The flat fields stay on OperatorSettings as
+the schema-1 view (health output); charging goes through the cost models only.
 
 THE COST IS SIMULATED. Paper brokers charge nothing, so the bot does not change any
 order, its cash, or the broker equity its risk rails use (invariant #4: equity is
@@ -16,30 +31,33 @@ always read fresh from the broker). It appends one line per charged order to
 `operator_fees.jsonl` next to the settings file; the console's exporter subtracts the
 running total from the equity it shows and puts each fee on the matching transaction
 (`ref` is that transaction's key in the exporter: "buy:<trade_id>" for a filled entry,
-"close:<trade_id>" for a close). It is not a fill cost: it never goes into the
-backtester, the slippage numbers or the outcome P&L.
+"close:<trade_id>" for a close). Each line also says how the fee was worked out
+(`settings_schema`, `model`, `gross`, `venue_fee`, `basis`). It is not a fill cost:
+it never goes into the backtester, the slippage numbers, sizing, the rails or the
+outcome P&L.
 
 THE FREQUENCY changes a few entry knobs for the cycle (`apply_frequency`). "medium" is
 the bot exactly as configured in config.yaml — the config object comes back untouched.
 
-A missing or unreadable file means "no operator settings yet": no cost, medium
-frequency. That is the behaviour before this module existed.
+A missing or unreadable file means "no operator settings yet": every market `off`
+(no cost), medium frequency. That is the behaviour before this module existed.
 """
 
 from __future__ import annotations
 
 import copy
 import json
-import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+
+import cost_models
 
 SETTINGS_FILE = "operator_settings.json"
 FEES_FILE = "operator_fees.jsonl"
 FREQUENCIES = ("low", "medium", "high")
-# Stocks and options always pay the cost; crypto and FX only when the operator says so.
-MARKETS = ("equities", "options", "crypto", "fx")
+MARKETS = cost_models.MARKETS
+# Schema 1's bound on fee_per_trade (cost_models.from_settings enforces it).
 FEE_MAX = 1000.0
 
 # This bot trades US equities in USD on Alpaca paper.
@@ -63,18 +81,34 @@ FREQUENCY_MAP = {
 }
 
 
+def no_costs() -> dict:
+    """Every market `off`: what the bot charges with no settings file. The values
+    are the research's, so the dict is a valid cost-models block."""
+    return {m: dict(cost_models.RECOMMENDED[m], model="off") for m in MARKETS}
+
+
 @dataclass(frozen=True)
 class OperatorSettings:
     version: int = 0  # 0 = no file: nothing set yet
+    # The schema-1 view of the costs (cost_models.v1_equivalent), kept for health
+    # output and older readers. NOT used to charge: charge() reads `costs`.
     fee_per_trade: float = 0.0
     fee_on_crypto: bool = False
     fee_on_fx: bool = False
     frequency: str = "medium"
     updated_at: str = ""
     problem: str = ""  # why the file was ignored, for health output; "" when fine
+    # How the costs were read: 2 = the file's `costs` block, 1 = the flat schema-1
+    # fields (a schema-1 file, or a schema-2 file whose `costs` were invalid),
+    # 0 = no file / file ignored.
+    schema: int = 0
+    # cost_models' normalised block, every market present. Plain dicts so the
+    # settings ride in the cycle's cfg as JSON (to_cfg/from_cfg).
+    costs: dict = field(default_factory=no_costs, hash=False)
 
     def fee_for(self, market: str) -> float:
-        """The cost one order pays in this market under these settings."""
+        """The SCHEMA-1 view: the flat cost one order paid in this market under
+        schema 1. Kept for older callers and tests; charge() does not use it."""
         if market not in MARKETS:
             raise ValueError(f"unknown market {market!r}")
         if market == "crypto" and not self.fee_on_crypto:
@@ -83,11 +117,15 @@ class OperatorSettings:
             return 0.0
         return self.fee_per_trade
 
+    def describe(self, market: str | None = None) -> str:
+        """This bot's market line, e.g. "US$0.005 a share, at least US$1.00 an
+        order, at most 1% of its value", or "no cost"."""
+        return cost_models.describe(self.costs, market or MARKET)
+
     def summary(self) -> str:
         """One line for logs and the ledger."""
-        s = (f"v{self.version} fee=${self.fee_per_trade:.2f}/trade "
-             f"(crypto={'on' if self.fee_on_crypto else 'off'}, "
-             f"fx={'on' if self.fee_on_fx else 'off'}) "
+        s = (f"v{self.version} schema={self.schema} "
+             f"{MARKET} cost=({self.describe()}) "
              f"frequency={self.frequency}")
         return s + (f" | problem: {self.problem}" if self.problem else "")
 
@@ -103,20 +141,26 @@ def load(state_dir: Path | str) -> OperatorSettings:
     except (OSError, ValueError) as e:
         return OperatorSettings(problem=f"operator settings unreadable: {e}")
     try:
-        fee = float(raw["fee_per_trade"])
         freq = str(raw["frequency"])
         version = int(raw["version"])
-        if not math.isfinite(fee) or not 0 <= fee <= FEE_MAX:
-            raise ValueError(f"fee_per_trade {fee} out of range")
         if freq not in FREQUENCIES:
             raise ValueError(f"frequency {freq!r}")
+        # The costs: schema 2's `costs` block, or the flat schema-1 fields (also
+        # the fallback when `costs` is invalid; `problem` then says so). Raises
+        # only when the flat fields are bad too: the whole file is ignored then.
+        costs, problem = cost_models.from_settings(raw)
+        schema = 2 if raw.get("schema") == cost_models.SCHEMA and not problem else 1
+        v1 = cost_models.v1_equivalent(costs)
         return OperatorSettings(
             version=version,
-            fee_per_trade=round(fee, 2),
-            fee_on_crypto=raw.get("fee_on_crypto") is True,
-            fee_on_fx=raw.get("fee_on_fx") is True,
+            fee_per_trade=v1["fee_per_trade"],
+            fee_on_crypto=v1["fee_on_crypto"],
+            fee_on_fx=v1["fee_on_fx"],
             frequency=freq,
             updated_at=str(raw.get("updated_at") or ""),
+            problem=problem,
+            schema=schema,
+            costs=costs,
         )
     except (KeyError, TypeError, ValueError) as e:
         return OperatorSettings(problem=f"operator settings invalid: {e}")
@@ -198,11 +242,29 @@ def charge(
     side: str,
     currency: str = "USD",
     ts: datetime | None = None,
+    shares: float | None = None,
+    contracts: float | None = None,
+    units: float | None = None,
+    notional: float | None = None,
+    pip: float | None = None,
+    quote_rate: float | None = None,
+    venue_fee: float = 0.0,
 ) -> float:
-    """Charge one order. Appends a line to operator_fees.jsonl and returns the fee, or
-    returns 0.0 and writes nothing when the market pays no cost or `ref` was already
-    charged. `ref` must be the exporter's transaction key for this order."""
-    fee = settings.fee_for(market)
+    """Charge one order under the market's cost model. Appends a line to
+    operator_fees.jsonl and returns the fee, or returns 0.0 and writes nothing when
+    the order costs nothing or `ref` was already charged. `ref` must be the
+    exporter's transaction key for this order.
+
+    The order's real figures (`shares`, `notional`, ...) go to
+    cost_models.order_cost, which raises ValueError when the model needs one that
+    was not given; `venue_fee` is what the venue already charged on this fill (0 on
+    commission-free paper), so the charge only tops it up to the model."""
+    if market not in MARKETS:
+        raise ValueError(f"unknown market {market!r}")
+    gross, basis = cost_models.order_cost(
+        settings.costs, market, shares=shares, contracts=contracts, units=units,
+        notional=notional, pip=pip, quote_rate=quote_rate)
+    fee = cost_models.charge_amount(gross, venue_fee)
     if fee <= 0 or ref in charged_refs(state_dir):
         return 0.0
     line = {
@@ -214,6 +276,11 @@ def charge(
         "fee": fee,
         "currency": currency,
         "settings_version": settings.version,
+        "settings_schema": settings.schema,
+        "model": settings.costs[market]["model"],
+        "gross": gross,
+        "venue_fee": round(max(0.0, float(venue_fee or 0.0)), 4),
+        "basis": basis,
     }
     Path(state_dir).mkdir(parents=True, exist_ok=True)
     with open(Path(state_dir) / FEES_FILE, "a") as f:

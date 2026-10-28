@@ -89,8 +89,10 @@ def configure_logging() -> None:
 
 
 def _charge_operator_fee(cfg: dict | None, ref: str, symbol: str, side: str,
-                         ts: str | None = None) -> float:
-    """Charge the operator's SIMULATED cost per trade for one filled order.
+                         ts: str | None = None, *,
+                         shares: float | None = None,
+                         price: float | None = None) -> float:
+    """Charge the operator's SIMULATED cost for one filled order.
 
     Appends to memory/operator_fees.jsonl (operator_settings.charge) and nothing
     else: no order, cash, equity, sizing or rail sees it — the console subtracts
@@ -98,6 +100,14 @@ def _charge_operator_fee(cfg: dict | None, ref: str, symbol: str, side: str,
     transaction key for this order: "buy:<trade_id>" for a filled entry,
     "close:<trade_id>" for its close. Idempotent on ref. Uses the settings this
     cycle loaded in _bootstrap_cycle; a cfg without them charges nothing.
+
+    `shares` (the filled quantity) and `price` (the fill price) are the order's
+    real figures; the equities cost model (per_share, with its 1% cap) gets
+    shares and notional = |shares| x price, worked out here so a bad figure is
+    logged rather than raised. A flat or off model ignores them. Alpaca paper
+    charges no commission, so the venue fee is 0. A model that needs a figure
+    the caller did not pass raises inside charge() and is logged here, not
+    invented.
     Never raises: bookkeeping must not cost a trade.
     """
     settings = operator_settings.from_cfg(cfg)
@@ -109,13 +119,17 @@ def _charge_operator_fee(cfg: dict | None, ref: str, symbol: str, side: str,
             when = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
             if when.tzinfo is None:
                 when = when.replace(tzinfo=timezone.utc)
+        notional = (abs(float(shares)) * float(price)
+                    if shares is not None and price is not None else None)
         fee = operator_settings.charge(
             statepaths.operator_dir(cfg), settings, ref=ref,
             market=operator_settings.MARKET, symbol=symbol, side=side,
-            currency=operator_settings.CURRENCY, ts=when)
+            currency=operator_settings.CURRENCY, ts=when,
+            shares=shares, notional=notional, venue_fee=0.0)
         if fee:
-            log.info("operator cost $%.2f charged on %s (%s %s, settings v%s)",
-                     fee, ref, side, symbol, settings.version)
+            log.info("operator cost $%.4f charged on %s (%s %s, settings v%s "
+                     "schema %s)", fee, ref, side, symbol, settings.version,
+                     settings.schema)
         return fee
     except Exception as e:  # noqa: BLE001 — never block the trade it describes
         log.error("operator cost for %s not recorded: %s", ref, e)
@@ -167,8 +181,17 @@ def handle_close(trade_id: str, open_rec: dict, exit_price: float,
     # The closing order pays the operator's simulated cost (its exporter row is
     # "close:<trade_id>"). Not part of pnl above: the outcome record stays the
     # strategy's result, and the console nets the cost off displayed equity.
-    _charge_operator_fee(cfg, f"close:{trade_id}", open_rec.get("symbol") or "",
-                         "cover" if open_rec.get("action") == "short" else "sell")
+    # The close is the whole position, so shares = the ledger record's qty (no
+    # fallback: a record without one is logged by the charge, not guessed).
+    # exit_price is the broker's fill when a reconcile found one (a filled leg or
+    # closed order). A strategy exit books its close as the market order goes
+    # out, before any fill is recorded, so there it is the decision price (the
+    # bar close the signal saw) — the same price the outcome record carries; a
+    # reconcile with no fill passes its flagged last-price estimate.
+    _charge_operator_fee(
+        cfg, f"close:{trade_id}", open_rec.get("symbol") or "",
+        "cover" if open_rec.get("action") == "short" else "sell",
+        shares=open_rec.get("qty"), price=exit_price)
     if bench_pct is None:
         log.info("Closed trade %s (%s): P&L $%.2f (%.2f%%)",
                  trade_id, exit_reason, pnl, pnl_pct)
@@ -532,8 +555,13 @@ def adopt_untracked_positions(broker, ledger: Ledger, cfg: dict,
             # A held position is a confirmed fill, and the console shows an
             # adopted buy as "buy:<tid>". It never gets a fill_quality row (no
             # order id), so this is where its entry pays the operator cost.
+            # shares = the broker's held qty; the price is the broker's average
+            # entry (its fill price). Only when the broker omits that is it
+            # market_value / qty above, the current mark — the fill price is
+            # then not recorded anywhere.
             if action == "buy":
-                _charge_operator_fee(cfg, f"buy:{tid}", symbol, "buy", fill_ts)
+                _charge_operator_fee(cfg, f"buy:{tid}", symbol, "buy", fill_ts,
+                                     shares=qty, price=entry)
             log.warning("Adopted untracked %s position: qty %d @ $%.2f "
                         "(trade %s) — an entry filled but its ledger write was "
                         "lost", symbol, qty, float(entry), tid)
@@ -677,8 +705,13 @@ def record_fill_quality(broker, ledger: Ledger, max_checks: int = 20,
             ledger.log_fill_quality(rec["trade_id"], rec["symbol"],
                                     rec["action"], signal, fill, bps)
             if rec["action"] == "buy" and rec["trade_id"] not in unfilled:
-                _charge_operator_fee(cfg, f"buy:{rec['trade_id']}",
-                                     rec["symbol"], "buy", o.get("filled_at"))
+                # The broker's filled qty and average fill price. Broker.get_order
+                # always records filled_qty; the decision's ordered qty is the
+                # fallback only for an order record that lacks it.
+                _charge_operator_fee(
+                    cfg, f"buy:{rec['trade_id']}", rec["symbol"], "buy",
+                    o.get("filled_at"),
+                    shares=o.get("filled_qty") or rec.get("qty"), price=fill)
     except Exception as e:  # noqa: BLE001 — instrumentation never kills a cycle
         log.error("fill-quality pass failed: %s", e)
 

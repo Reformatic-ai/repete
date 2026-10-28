@@ -1,10 +1,14 @@
-"""Operator settings from the Reformatic console: a simulated cost per trade and a
-trade frequency (src/operator_settings.py and its call sites in main.py/health.py).
+"""Operator settings from the Reformatic console: a simulated cost model per market
+and a trade frequency (src/operator_settings.py, src/cost_models.py and their call
+sites in main.py/health.py).
 
-The two promises pinned here:
+The promises pinned here:
   * the cost is charged ONCE per filled order, under the console exporter's
     transaction key ("buy:<trade_id>" / "close:<trade_id>"), and never for an
     entry that did not fill; it changes no order, P&L or rail.
+  * each charge site passes the order's real filled shares and fill price, so a
+    schema-2 per_share model charges the reference amounts; a schema-1 file
+    still charges exactly its flat fee.
   * frequency "medium" is the bot exactly as configured: the config comes back
     as the SAME object, untouched.
 """
@@ -16,6 +20,7 @@ from datetime import datetime, timezone
 import pytest
 import yaml
 
+import cost_models
 import health
 import main
 import operator_settings as ops
@@ -62,6 +67,49 @@ def shipped_cfg():
 def _with_settings(cfg, opdir, **over):
     _write_settings(opdir, **over)
     return ops.to_cfg(cfg, ops.load(opdir))
+
+
+# The schema-2 file the console's sync writes (cost-models spec, 2026-10-27).
+V2_COSTS = {
+    "equities": {"model": "per_share", "flat_per_order": 1.0, "per_share": 0.005,
+                 "min_per_order": 1.0, "max_pct_of_value": 1.0},
+    "options": {"model": "per_contract", "flat_per_order": 1.4,
+                "per_contract": 0.65, "fees_per_contract": 0.025,
+                "min_per_order": 1.0},
+    "fx": {"model": "per_10k_units", "flat_per_order": 1.0, "per_10k_units": 1.0,
+           "spread_pips": 0.2},
+    "crypto": {"model": "percent", "flat_per_order": 1.0, "pct_of_value": 0.8},
+}
+
+
+def _write_v2(d, costs=None, **over):
+    return _write_settings(d, **{
+        "schema": 2, "version": 4, "frequency": "medium",
+        "updated_at": "2026-10-28T14:00:00Z",
+        "costs": copy.deepcopy(V2_COSTS if costs is None else costs),
+        "fee_per_trade": 1.0, "fee_on_crypto": False, "fee_on_fx": False,
+        **over})
+
+
+def _with_v2(cfg, opdir, **over):
+    _write_v2(opdir, **over)
+    return ops.to_cfg(cfg, ops.load(opdir))
+
+
+def _load_v2(opdir):
+    _write_v2(opdir)
+    return ops.load(opdir)
+
+
+def _v1(fee, crypto=False, fx=False, version=3):
+    """Settings as a schema-1 file loads them: flat models from the flat fields."""
+    return ops.OperatorSettings(
+        version=version, schema=1, fee_per_trade=fee, fee_on_crypto=crypto,
+        fee_on_fx=fx, costs=cost_models.from_v1(fee, crypto, fx))
+
+
+# shares, fill price, fee: the research's per_share reference numbers.
+EQUITY_REFERENCE = [(100, 50.0, 1.00), (1000, 50.0, 5.00), (5, 8.0, 0.40)]
 
 
 # ---------------------------------------------------------------- load()
@@ -140,7 +188,7 @@ def test_cfg_round_trip_and_absent():
 # ---------------------------------------------------------------- charge()
 
 def test_charge_writes_the_contract_line_once(tmp_path):
-    s = ops.OperatorSettings(version=3, fee_per_trade=9.0)
+    s = _v1(9.0)
     ts = datetime(2026, 10, 24, 15, 0, tzinfo=timezone.utc)
     assert ops.charge(tmp_path, s, ref="buy:t1", market="equities", symbol="SPY",
                       side="buy", ts=ts) == 9.0
@@ -149,12 +197,14 @@ def test_charge_writes_the_contract_line_once(tmp_path):
     lines = _fees(tmp_path)
     assert lines == [{"ts": "2026-10-24T15:00:00+00:00", "ref": "buy:t1",
                       "symbol": "SPY", "side": "buy", "market": "equities",
-                      "fee": 9.0, "currency": "USD", "settings_version": 3}]
+                      "fee": 9.0, "currency": "USD", "settings_version": 3,
+                      "settings_schema": 1, "model": "flat", "gross": 9.0,
+                      "venue_fee": 0.0, "basis": {"model": "flat"}}]
     assert ops.total(tmp_path) == 9.0
 
 
 def test_no_line_when_market_is_off_or_fee_is_zero(tmp_path):
-    s = ops.OperatorSettings(version=3, fee_per_trade=9.0)
+    s = _v1(9.0)
     assert ops.charge(tmp_path, s, ref="c1", market="crypto", symbol="BTC",
                       side="buy") == 0.0
     assert ops.charge(tmp_path, ops.OperatorSettings(), ref="e1",
@@ -164,7 +214,7 @@ def test_no_line_when_market_is_off_or_fee_is_zero(tmp_path):
 
 def test_charge_creates_the_dir_and_reads_skip_junk(tmp_path):
     d = tmp_path / "new"
-    s = ops.OperatorSettings(version=1, fee_per_trade=2.5)
+    s = _v1(2.5, version=1)
     ops.charge(d, s, ref="a", market="equities", symbol="X", side="buy")
     with open(d / ops.FEES_FILE, "a") as f:
         f.write("garbage\n{}\n" + json.dumps({"ref": "b", "fee": "x"}) + "\n")
@@ -550,8 +600,9 @@ def test_health_reports_settings_without_degrading(cfg, opdir, capsys,
                symbol="SPY", side="buy")
     s = health.status(cfg)
     assert s["operator_settings"] == {
-        "version": 3, "fee_per_trade": 9.0, "fee_on_crypto": False,
-        "fee_on_fx": False, "frequency": "high",
+        "version": 3, "schema": 1, "market": "equities",
+        "cost": "US$9.00 an order, flat", "fee_per_trade": 9.0,
+        "fee_on_crypto": False, "fee_on_fx": False, "frequency": "high",
         "updated_at": "2026-10-24T14:00:00Z", "fees_charged_total": 9.0,
         "problem": None}
 
@@ -561,7 +612,8 @@ def test_health_reports_settings_without_degrading(cfg, opdir, capsys,
     monkeypatch.setattr("sys.argv", ["health.py"])
     health.main()
     out = capsys.readouterr().out
-    assert "operator=v3 $9.00/trade high (charged $9.00)" in out
+    assert ("operator=v3 schema=1 cost=(US$9.00 an order, flat) high "
+            "(charged $9.00)") in out
     assert "(operator settings: operator settings invalid: x)" in out
 
 
@@ -573,3 +625,290 @@ def test_health_survives_a_broken_settings_reader(cfg, monkeypatch):
     assert s["operator_settings"]["problem"].startswith(
         "operator settings check failed")
     assert not any("operator" in p for p in s["problems"])
+
+
+# ================================================ cost models (settings schema 2)
+
+def test_cost_models_is_the_console_module_plus_one_header_line():
+    """cost_models.py is copied VERBATIM from the console's
+    reformatic/trading/costs.py: one provenance line on top, nothing edited."""
+    src = os.path.join(REPO, "src", "cost_models.py")
+    with open(src) as f:
+        first, second = f.readline(), f.readline()
+    assert first.startswith("# Copied from reformatic-console "
+                            "reformatic/trading/costs.py")
+    assert second.startswith('"""What a trade costs, market by market')
+
+
+@pytest.mark.parametrize("market,inputs,venue_fee,want", [
+    ("equities", {"shares": 100, "notional": 5000.0}, 0, 1.00),
+    ("equities", {"shares": 1000, "notional": 50000.0}, 0, 5.00),
+    ("equities", {"shares": 5, "notional": 40.0}, 0, 0.40),    # 1% cap
+    ("options", {"contracts": 2}, 0, 1.35),      # 1-lot two-leg spread
+    ("options", {"contracts": 1}, 0, 1.025),     # one contract, one leg
+    ("fx", {"units": 10_000, "pip": 0.0001, "quote_rate": 1.39}, 0, 1.278),
+    ("crypto", {"notional": 1000.0}, 2.60, 5.40),
+])
+def test_reference_numbers(market, inputs, venue_fee, want):
+    """The research's reference numbers, through the copied module."""
+    gross, _ = cost_models.order_cost(cost_models.validate(V2_COSTS), market,
+                                      **inputs)
+    assert cost_models.charge_amount(gross, venue_fee) == pytest.approx(want)
+
+
+def test_schema2_file_loads(tmp_path):
+    _write_v2(tmp_path, frequency="low")
+    s = ops.load(tmp_path)
+    assert (s.version, s.schema, s.frequency, s.problem) == (4, 2, "low", "")
+    assert s.updated_at == "2026-10-28T14:00:00Z"
+    assert s.costs == cost_models.validate(V2_COSTS)
+    # The schema-1 view is the per_share model's per-order minimum.
+    assert (s.fee_per_trade, s.fee_on_crypto, s.fee_on_fx) == (1.0, False, False)
+    assert s.describe() == ("US$0.005 a share, at least US$1.00 an order, "
+                            "at most 1% of its value")
+    assert s.summary() == ("v4 schema=2 equities cost=(US$0.005 a share, at least "
+                           "US$1.00 an order, at most 1% of its value) "
+                           "frequency=low")
+
+
+def test_schema2_file_does_not_need_valid_flat_fields(tmp_path):
+    """Valid `costs` are read as written; the schema-1 fields are only a
+    fallback, so a bad one there does not throw the file away."""
+    _write_v2(tmp_path, fee_per_trade="nine")
+    s = ops.load(tmp_path)
+    assert (s.schema, s.problem) == (2, "")
+    assert s.costs["equities"]["model"] == "per_share"
+
+
+def test_schema1_file_loads_and_charges_the_same_flat_amount(tmp_path):
+    _write_settings(tmp_path)                    # today's file: no schema, $9
+    s = ops.load(tmp_path)
+    assert (s.version, s.schema, s.problem) == (3, 1, "")
+    assert s.costs["equities"] == dict(cost_models.RECOMMENDED["equities"],
+                                       model="flat", flat_per_order=9.0)
+    assert s.costs["crypto"]["model"] == s.costs["fx"]["model"] == "off"
+    assert s.describe() == "US$9.00 an order, flat"
+    assert "v3 schema=1" in s.summary() and "US$9.00 an order, flat" in s.summary()
+    d = tmp_path / "fees"
+    # The flat fee whatever the order's size, and with no figures at all.
+    for ref, inputs in [("a", {"shares": 100, "notional": 5000.0}),
+                        ("b", {"shares": 5, "notional": 40.0}),
+                        ("c", {})]:
+        assert ops.charge(d, s, ref=ref, market="equities", symbol="SPY",
+                          side="buy", **inputs) == 9.0
+    assert ops.total(d) == 27.0
+
+
+@pytest.mark.parametrize("bad", [
+    "not an object",
+    {k: v for k, v in V2_COSTS.items() if k != "options"},        # market missing
+    {**V2_COSTS, "equities": {**V2_COSTS["equities"], "model": "per_contract"}},
+    {**V2_COSTS, "equities": {**V2_COSTS["equities"], "per_share": -0.005}},
+    {**V2_COSTS, "equities": {**V2_COSTS["equities"], "per_share": 2.0}},  # > 1
+    {**V2_COSTS, "crypto": {"model": "percent", "flat_per_order": 1.0}},   # key missing
+])
+def test_invalid_costs_block_falls_back_to_schema1_with_problem(tmp_path, bad):
+    _write_v2(tmp_path, costs=bad, fee_per_trade=9.0, frequency="high")
+    s = ops.load(tmp_path)
+    assert s.schema == 1
+    assert s.problem.startswith("costs invalid (")
+    assert s.problem.endswith("using the flat schema-1 cost")
+    assert s.costs == cost_models.from_v1(9.0, False, False)
+    # Version and frequency still come from the file.
+    assert (s.version, s.frequency) == (4, "high")
+    assert ops.charge(tmp_path, s, ref="x", market="equities", symbol="SPY",
+                      side="buy", shares=100, notional=5000.0) == 9.0
+    assert "problem: costs invalid" in s.summary()
+
+
+def test_invalid_costs_and_bad_flat_fields_ignore_the_file(tmp_path):
+    _write_v2(tmp_path, costs={"equities": {}}, fee_per_trade="nine")
+    s = ops.load(tmp_path)
+    assert s.problem.startswith("operator settings invalid")
+    assert (s.version, s.schema, s.frequency) == (0, 0, "medium")
+    assert {c["model"] for c in s.costs.values()} == {"off"}
+
+
+def test_no_file_default_is_every_market_off(tmp_path):
+    for s in (ops.OperatorSettings(), ops.load(tmp_path)):
+        assert {m: c["model"] for m, c in s.costs.items()} == {
+            m: "off" for m in cost_models.MARKETS}
+        cost_models.validate(s.costs)                # a well-formed block
+        assert s.schema == 0 and s.describe() == "no cost"
+        assert ops.charge(tmp_path, s, ref="r", market="equities", symbol="SPY",
+                          side="buy", shares=100, notional=5000.0) == 0.0
+    assert _fees(tmp_path) == []
+
+
+def test_costs_survive_the_cfg_round_trip(tmp_path):
+    _write_v2(tmp_path)
+    s = ops.load(tmp_path)
+    cfg = json.loads(json.dumps(ops.to_cfg({}, s)))   # cfg stays JSON-clean
+    back = ops.from_cfg(cfg)
+    assert back == s and back.costs == s.costs and back.schema == 2
+
+
+@pytest.mark.parametrize("shares,price,want", EQUITY_REFERENCE)
+def test_schema2_charge_writes_the_spec_line(tmp_path, shares, price, want):
+    _write_v2(tmp_path)
+    s = ops.load(tmp_path)
+    ts = datetime(2026, 10, 28, 15, 0, tzinfo=timezone.utc)
+    d = tmp_path / "fees"
+    assert ops.charge(d, s, ref="buy:t1", market="equities", symbol="SPY",
+                      side="buy", ts=ts, shares=shares,
+                      notional=shares * price) == pytest.approx(want)
+    basis = {"model": "per_share", "shares": float(shares),
+             "notional": shares * price}
+    if want < 1.0:
+        basis["capped"] = True
+    assert _fees(d) == [{
+        "ts": "2026-10-28T15:00:00+00:00", "ref": "buy:t1", "symbol": "SPY",
+        "side": "buy", "market": "equities", "fee": want, "currency": "USD",
+        "settings_version": 4, "settings_schema": 2, "model": "per_share",
+        "gross": want, "venue_fee": 0.0, "basis": basis}]
+
+
+def test_schema2_duplicate_ref_charges_once(tmp_path):
+    _write_v2(tmp_path)
+    s = ops.load(tmp_path)
+    d = tmp_path / "fees"
+    for _ in range(3):
+        ops.charge(d, s, ref="close:t1", market="equities", symbol="SPY",
+                   side="sell", shares=1000, notional=50_000.0)
+    assert [f["ref"] for f in _fees(d)] == ["close:t1"]
+    assert ops.total(d) == 5.0
+
+
+def test_a_missing_input_is_logged_not_invented(tmp_path, opdir, caplog):
+    """per_share needs the share count; the never-raise wrapper logs the gap
+    and writes nothing. A flat schema-1 model needs no figures."""
+    cfg = _with_v2({}, opdir)
+    assert main._charge_operator_fee(cfg, "buy:x", "SPY", "buy") == 0.0
+    assert "per_share needs shares" in caplog.text
+    assert _fees(opdir) == []
+    cfg = _with_settings({}, opdir)              # schema 1, flat $9
+    assert main._charge_operator_fee(cfg, "buy:x", "SPY", "buy") == 9.0
+
+
+# ----------------------------------- schema 2 at each of the three charge sites
+
+@pytest.mark.parametrize("shares,price,want", EQUITY_REFERENCE)
+def test_entry_fill_site_charges_the_broker_fill(tmp_path, opdir, shares,
+                                                 price, want):
+    """The decision said 10 @ $100; the broker filled `shares` @ `price`. The
+    charge uses the broker's figures, not the decision's."""
+    cfg = _with_v2({}, opdir)
+    led = Ledger(str(tmp_path / "ledger.jsonl"))
+    tid = _buy(led)
+    main.record_fill_quality(
+        FillBroker({"o-1": {"filled_avg_price": price, "filled_qty": shares,
+                            "filled_at": "2026-10-28T13:30:01Z"}}), led, cfg=cfg)
+    [f] = _fees(opdir)
+    assert (f["ref"], f["fee"], f["model"]) == (f"buy:{tid}", want, "per_share")
+    assert (f["basis"]["shares"], f["basis"]["notional"]) == (shares,
+                                                              shares * price)
+
+
+def test_entry_fill_without_filled_qty_falls_back_to_the_decision_qty(
+        tmp_path, opdir):
+    cfg = _with_v2({}, opdir)
+    led = Ledger(str(tmp_path / "ledger.jsonl"))
+    _buy(led)                                    # qty 10
+    main.record_fill_quality(FillBroker({"o-1": {"filled_avg_price": 8.0}}),
+                             led, cfg=cfg)
+    [f] = _fees(opdir)
+    assert f["basis"] == {"model": "per_share", "shares": 10.0,
+                          "notional": 80.0, "capped": True}
+    assert f["fee"] == 0.8
+
+
+@pytest.mark.parametrize("shares,price,want", EQUITY_REFERENCE)
+def test_adopted_position_site_charges_the_broker_position(env, opdir, shares,
+                                                           price, want):
+    ledger, _, cfg = env
+    cfg = ops.to_cfg(cfg, _load_v2(opdir))
+    main.adopt_untracked_positions(
+        broker=None, ledger=ledger, cfg=cfg,
+        positions={"SPY": {"qty": shares, "avg_entry": price,
+                           "market_value": shares * price * 1.1}})
+    [f] = _fees(opdir)
+    assert f["ref"].startswith("buy:") and f["fee"] == pytest.approx(want)
+    assert (f["basis"]["shares"], f["basis"]["notional"]) == (shares,
+                                                              shares * price)
+
+
+@pytest.mark.parametrize("action,side", [("buy", "sell"), ("short", "cover")])
+@pytest.mark.parametrize("shares,price,want", EQUITY_REFERENCE)
+def test_close_site_charges_the_exit_qty_and_exit_price(env, opdir, shares,
+                                                        price, want, action,
+                                                        side):
+    ledger, memory, cfg = env
+    cfg = ops.to_cfg(cfg, _load_v2(opdir))
+    tid = ledger.log_decision("SPY", action, "test", {}, None, executed=True,
+                              order={"id": "o-1"}, entry_price=60.0, qty=shares)
+    rec = ledger.open_buys()[tid]
+    main.handle_close(tid, rec, price, ledger, memory, cfg)
+    main.handle_close(tid, rec, price, ledger, memory, cfg)   # replay: once
+    [f] = _fees(opdir)
+    assert (f["ref"], f["side"], f["fee"]) == (f"close:{tid}", side,
+                                               pytest.approx(want))
+    assert (f["basis"]["shares"], f["basis"]["notional"]) == (shares,
+                                                              shares * price)
+    # The outcome P&L is the strategy's, untouched by the cost.
+    out = [r for r in ledger.all_records() if r["type"] == "outcome"][0]
+    sign = -1 if action == "short" else 1
+    assert out["pnl"] == pytest.approx(sign * (price - 60.0) * shares)
+
+
+def test_schema2_buy_then_stop_out_charges_the_exporter_rows(cycle_env, opdir):
+    """End to end under per_share: a 50-share entry filled @ $20 ($1,000) and
+    stopped out @ $12.67 ($633.50) each pay the US$1.00 minimum."""
+    cfg, install = cycle_env
+    _write_v2(opdir)
+    install(FakeCycleBroker(make_bars(BUY_CLOSES)))
+    main.run_cycle()
+    assert _fees(opdir) == []
+    install(FakeCycleBroker(make_bars(BUY_CLOSES + [20], start_day=2),
+                            positions={}, orders={
+        "entry-1": FILLED_ENTRY,
+        "leg-stop": {"id": "leg-stop", "status": "OrderStatus.FILLED",
+                     "type": "OrderType.STOP", "filled_avg_price": 12.67,
+                     "filled_qty": 50, "legs": []},
+        "leg-tp": {"id": "leg-tp", "status": "OrderStatus.CANCELED",
+                   "type": "OrderType.LIMIT", "filled_avg_price": None,
+                   "filled_qty": 0, "legs": []}}))
+    main.run_cycle()
+    fees = {f["ref"].split(":")[0]: f for f in _fees(opdir)}
+    assert {f["ref"] for f in fees.values()} == _exporter_keys(
+        cfg["memory"]["ledger_path"])
+    assert fees["buy"]["basis"] == {"model": "per_share", "shares": 50.0,
+                                    "notional": 1000.0}
+    assert fees["close"]["basis"] == {"model": "per_share", "shares": 50.0,
+                                      "notional": 633.5}
+    assert ops.total(opdir) == 2.0
+
+
+def test_schema2_cycle_logs_the_market_line(cycle_env, opdir):
+    cfg, install = cycle_env
+    _write_v2(opdir)
+    install(FakeCycleBroker(make_bars(BUY_CLOSES)))
+    main.run_cycle()
+    [ev] = [r for r in Ledger(cfg["memory"]["ledger_path"]).all_records()
+            if r.get("event") == "operator_settings"]
+    assert ev["detail"].startswith("v4 schema=2 equities cost=(US$0.005 a share")
+
+
+def test_health_reports_the_schema2_model(cfg, opdir, capsys, monkeypatch):
+    _write_v2(opdir)
+    s = health.status(cfg)
+    op = s["operator_settings"]
+    assert (op["version"], op["schema"], op["market"]) == (4, 2, "equities")
+    assert op["cost"] == ("US$0.005 a share, at least US$1.00 an order, "
+                          "at most 1% of its value")
+    assert op["fee_per_trade"] == 1.0 and op["problem"] is None
+    monkeypatch.setattr(health, "status", lambda: s)
+    monkeypatch.setattr("sys.argv", ["health.py"])
+    health.main()
+    assert ("operator=v4 schema=2 cost=(US$0.005 a share, at least US$1.00 an "
+            "order, at most 1% of its value) medium (charged $0.00)"
+            ) in capsys.readouterr().out
