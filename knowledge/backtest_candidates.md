@@ -7417,3 +7417,140 @@ return, Claude can be replayed against those. Divergence #25 carries it.
 Trial count through §79: 241 arm runs. §79 runs no arms; K is closed at 16.
 
 <!-- recall: section=§79 specs= -->
+
+## §80 — GATES, BACKTESTS AND RAILS READ AFTER-COST RESULTS FIRST (DECISION, K stays closed at 16, 2026-10-28)
+
+**Registers nothing and records no verdict.** Like §77 it is an owner's
+decision, written down because a future reader needs it to understand why the
+rails and the gates stopped measuring the same thing they measured before.
+
+### The decision, in the owner's words
+
+Connor, 2026-10-28:
+
+> "Yes: make gates, backtests and the drawdown/retire rails use after-cost results first (repete4's override included). Entry cost filters later, bot by bot."
+
+The cost is the operator's simulated cost per order (`src/operator_settings.py`,
+models in `src/cost_models.py`, the console's `costs.py` verbatim). Until today
+it only lowered the equity the console *showed*. Nothing that decides anything
+saw it. For this bot (equities) the research values are US$0.005 a share, at
+least US$1.00 an order, at most 1% of the order's value.
+
+### What changed
+
+**The live rails.** RAIL EQUITY = broker equity − every operator cost charged so
+far, computed once per cycle right after the broker read (`main._rail_equity`)
+and read from `memory/operator_fees.jsonl` by a STRICT reader
+(`operator_settings.read_strict`): a missing file is 0; an unreadable file, a
+torn line or a line in another currency is never 0 — the rails fail CLOSED
+(every entry refused under `rail_equity_unknown`, an alert, a ledger event,
+health DEGRADED). It feeds:
+
+- **the drawdown breaker** — measured on rail equity against a peak kept on the
+  same basis. The stored GROSS peak is moved ONCE, on the first run of this
+  code, to `peak − cost charged up to now`; the file is stamped
+  `"basis": "after_cost"` with the gross figure and the amount beside it, so a
+  rerun is a no-op (`risk.update_high_water`).
+- **the daily-loss kill switch** — today's rail equity against the broker's
+  `last_equity` less the cost charged before today (New York day boundary).
+- **the live kill** and **the decay monitor** — each closed trade's P&L less its
+  OWN cost (entry fill + close, joined on the fee line's `ref`). The decay
+  monitor's random null is charged the same model on both of its legs, so the
+  two sides pay alike.
+
+The cycle charges the entry fills it confirms BEFORE the rails read equity, and
+refreshes rail equity after reconcile/adoption charge their closes, so no rail
+sees a cost one run late. Broker equity is unchanged everywhere else: sizing,
+the caps, and the `equity` on `cycle_complete` the console reads (it nets the
+cost off itself; `rail_equity` now sits beside it). Health shows the drawdown
+before and after cost.
+
+**The backtester and the gates.** Every simulated fill pays
+`cost_models.order_cost` on its shares and notional, topped up over any venue
+fee rather than added to it; both benchmarks pay it too. The cost is kept OUT of
+the sim's cash — live sizes on broker equity, which never includes it — and
+comes off every trade's P&L, the equity curve (so maxDD and Sharpe), total
+return, profit factor, the significance P&Ls, the sim's own drawdown rail and
+therefore every clause. The block is PINNED in the gate spec (`operator_costs:`
+— the cost-models block written out in full, or `false` for deliberately gross),
+never read from the console's settings file, so a run is reproducible from its
+spec. `register_gate.py` refuses a NEW spec that does not declare it (after the
+already-registered and verdict checks, so every existing registration stays
+idempotent); `run_gate.py` stamps the block, its sha256 and what each arm paid
+on the verdict row.
+
+### What did not change
+
+- **No threshold.** `risk.live_kill` (15 trades, PF 0.8), `daily_loss_limit_pct`,
+  `max_drawdown_pct`, the decay monitor's 5th/95th percentiles and every gate
+  clause are exactly as registered. Only the P&L they read moved.
+- **No frozen record.** Absent block = no operator cost, and `config.yaml` (which
+  no spec hashes) is stripped of any block before a frozen spec runs. Four
+  frozen specs were re-executed on this code and on the code before it
+  (`origin/cost-models-v2`, b0b1387): `s39`, `s72a`, `s64a`, `s73a` — 8 arms,
+  every arm summary, every clause and every trial row byte-identical; the
+  verdict row gains only the three `operator_cost*` stamps (null / 0.0). (`s72a`
+  also still matches its row in `research/verdicts.jsonl` exactly; `s39`,
+  `s64a` and `s73a` drifted from theirs long before this change, identically on
+  both codes.)
+- **K.** Closed at 16. Nothing registered.
+- **Sizing and entry filters.** "Entry cost filters later, bot by bot."
+
+### The re-score: §43's pass mark, after cost
+
+The live strategy is the shipped ensemble (`ma_crossover`, `tsmom`, `meanrev`),
+and the gate it answers to is its own: §43, `s43a`–`d`. §43 ran with the judge
+modelled; the judge calibration now REFUSES (`context_version` 3, refit
+pending, §78), so a judge-on re-score cannot be run. What could be run was §43's
+four clauses verbatim, judge OFF, once gross and once at the research cost
+block, as a **scratch reproduce**: eight single-arm METHOD-shaped specs
+registered only into a scratch registrations file, scored by `run_gate.py` with
+`--registrations/--verdicts/--trials` pointed outside `research/`. Nothing here
+was appended to the record.
+
+| period | return gross → after cost | PF | maxDD | trades | cost paid | exposure-matched bar | clauses |
+|---|---|---|---|---|---|---|---|
+| 2000-2006 | −7.19% → **−7.46%** | 0.433 → 0.421 | 11.52 → 11.76% | 37 → 37 | $274.49 | +4.78% → +4.75% | 1/4 → 1/4 |
+| 2007-2013 | +3.49% → **+2.62%** | 1.165 → 1.121 | 12.14 → 12.64% | 104 → 104 | $875.47 | +7.82% → +7.74% | 1/4 → 1/4 |
+| 2014-2019 | +23.59% → **+20.37%** | 1.557 → 1.471 | 10.83 → 11.50% | 375 → 372 | $3,280.25 | +24.39% → +24.05% | 1/4 → 1/4 |
+| 2022-2026 | +107.77% → **+105.84%** | 1.652 → 1.636 | 10.32 → 10.44% | 969 → 969 | $1,922.17 | +33.91% → +33.37% | 4/4 → 4/4 |
+
+Block sha256 `97147170b54b8105…` (the research values). Cash $100,000.
+
+**No clause flips in either direction.** The cost drag is 0.27pp to 3.22pp of
+return, and the margins it eats are larger in every period. 2014-2019 is where
+it bites: 375 round trips at roughly US$1 a side, and the period's
+exposure-matched FAIL widens from −0.80pp to −3.68pp. 2014-2019 also shows the
+after-cost drawdown rail at work in the simulator — three fewer trades, because
+the sim's breaker now measures after cost, as live's does.
+
+**Read the 2022-2026 row with care.** The gross control clears all four of
+§43's clauses there. That is **not** a verdict and licenses nothing: the judge
+is OFF (live, it cuts most buys and §43's judge-on run of this very period
+failed by −9.84pp), the universe is survivor-selected (§48, §51), the shipped
+config has moved since §43 was frozen, and this ran in scratch without a prior
+written before the data. It is reported because leaving a passing cell out of a
+table is how a record starts flattering itself. The after-cost cell is the
+point of this section: it moves by −1.93pp and stays where the gross one is.
+
+Both benchmarks pay the cost too, so the exposure-matched bar falls slightly
+(by ~1pp × deployment — the universe buy-and-hold is 500 equal $200 slices,
+each paying the US$1 minimum on the way in and out). That makes the after-cost
+bar a little EASIER, never harder; no clause sat close enough for it to matter.
+
+### Accounting
+
+24 arm runs executed outside the record: the 8 re-score arms above and the 16
+reproduction arms (8 per code). None was appended to `research/trials.jsonl`:
+the brief forbade spending trial budget, none tests a hypothesis, and none
+selects anything. They are counted here so the number is recoverable — a
+reader who counts them reaches 241 + 24 = 265.
+
+Divergence #26 records what still differs: the gates charge a pinned research
+block while live charges whatever the console says that cycle, the simulator
+charges a short's opening order while live charges only `buy` entries, and
+live's once-per-cycle rail equity can sit a cycle's close costs behind.
+
+Trial count through §80: 241 arm runs. §80 records no arms; K is closed at 16.
+
+<!-- recall: section=§80 specs= -->

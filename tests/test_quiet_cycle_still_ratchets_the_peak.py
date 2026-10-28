@@ -165,7 +165,11 @@ def test_the_ratchet_runs_before_any_decision(cycle_env):
     # every early return, which is exactly what the ordering below pins.
     unpack = src.index(
         "cfg, ledger, memory, broker, account, positions, halted = started")
-    ratchet = src.index('risk.update_high_water(account["equity"])')
+    # 2026-10-28 (owner decision: the rails read after-cost results): the
+    # ratchet takes RAIL equity — broker equity less the operator cost charged
+    # so far, computed in _bootstrap_cycle from the same fresh account read.
+    # Same placement, same property; only the figure it ratchets on moved.
+    ratchet = src.index('risk.update_high_water(risk.rail_equity(account),')
     # The daily-loss kill switch is the first thing in _run_cycle that can
     # return early. W4-7 moved its body into _kill_switch_fired, so the call is
     # what marks the boundary now.

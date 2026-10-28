@@ -87,8 +87,12 @@ def _today_et(now: datetime | None = None) -> str:
 
 
 def build(cfg: dict, records: list[dict], *, equity: float | None,
-          n_positions: int | None, now: datetime | None = None) -> dict:
-    """Assemble the five fields. Pure — reads records, writes nothing."""
+          n_positions: int | None, now: datetime | None = None,
+          rail_equity: float | None = None, rail_problem: str = "") -> dict:
+    """Assemble the five fields. Pure — reads records, writes nothing.
+
+    `rail_equity` (2026-10-28) is broker equity less the operator cost charged
+    so far — what the drawdown rail measures. Omitted, it is `equity`."""
     today = _today_et(now)
 
     changed = {"entries": 0, "exits": 0, "refused": 0}
@@ -123,7 +127,10 @@ def build(cfg: dict, records: list[dict], *, equity: float | None,
     try:
         import risk
         limit = float((cfg.get("risk") or {}).get("max_drawdown_pct", 10.0))
-        dd = risk.drawdown_state(equity, limit)
+        dd = risk.drawdown_state(
+            equity, limit,
+            rail_equity=equity if rail_equity is None and not rail_problem
+            else rail_equity, rail_problem=rail_problem)
         remaining_risk["drawdown_pct"] = dd.get("drawdown_pct")
         remaining_risk["entries_blocked"] = dd.get("engaged")
         if dd.get("drawdown_pct") is not None:
@@ -146,11 +153,14 @@ def build(cfg: dict, records: list[dict], *, equity: float | None,
 
 
 def record(ledger, cfg: dict, *, equity: float | None,
-           n_positions: int | None, now: datetime | None = None) -> dict | None:
+           n_positions: int | None, now: datetime | None = None,
+           rail_equity: float | None = None,
+           rail_problem: str = "") -> dict | None:
     """Write one `handoff` event. Never raises; returns the payload or None."""
     try:
         payload = build(cfg, ledger.all_records(), equity=equity,
-                        n_positions=n_positions, now=now)
+                        n_positions=n_positions, now=now,
+                        rail_equity=rail_equity, rail_problem=rail_problem)
         ledger.log_event("handoff", json.dumps(payload))
         return payload
     except Exception as e:  # noqa: BLE001 — the cycle outranks its own reporting

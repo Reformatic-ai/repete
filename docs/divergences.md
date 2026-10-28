@@ -4,18 +4,19 @@ Every gate verdict in `knowledge/backtest_candidates.md` rests on the simulator
 being a faithful model of the live bot. Where the two differ, a verdict measures
 a bot that does not exist.
 
-Twenty-five such differences have been found. Until 2026-07-28 they existed **only as
+Twenty-six such differences have been found. Until 2026-07-28 they existed **only as
 prose scattered across forty sections of the gate ledger** — there was no list,
 so "how many are open?" had no answer, and #8 could sit closed-on-paper and open
 in fact for three days without anyone noticing. This file is the list.
 
-**Open as of 2026-08-28: #13, #14, #15, #16, #18, #19, #21, #23, #24 and #25.** Eight of the ten
+**Open as of 2026-10-28: #13, #14, #15, #16, #18, #19, #21, #23, #24, #25 and #26.** Nine of the eleven
 are open *by construction* rather than by defect — a sampling fact about the live
 record, two judge inputs the simulator has no mechanism to represent, a cost the
 paper broker does not charge, a fill-session hazard that only materialises when
 the cycle runs long, a scanner that tests a live quote where the simulator
-tests a completed close, and a judge whose identity changed with no baseline
-left to compare it against. **#19 and #23 are not.** #19 is a plain
+tests a completed close, a judge whose identity changed with no baseline
+left to compare it against, and an operator cost the gates pin while live
+charges whatever the console says today. **#19 and #23 are not.** #19 is a plain
 omission, found 2026-08-09, in which a live entry filter has been silently
 switched off in every gate ever run because no spec supplies the data it needs.
 **#23 is a third kind again** — a live rail the simulator never modelled, whose
@@ -68,6 +69,7 @@ code" is not closed; the repo has been wrong about that before.
 | 23 | **The live kill retires a strategy's entries; the simulator has never modelled it** | **open** | found 2026-08-23; `tests/test_live_kill_is_live_only.py` pins the gap in both directions but does not close it — see the entry |
 | 24 | **The live judge reads a per-symbol research dossier; the simulator models the judge as a distribution and cannot represent one** | **open** | open by construction — registered 2026-08-23 by the change that caused it; the calibration refuses until re-fit |
 | 25 | **The judge is a different model (`qwen3.8-27b`, self-hosted) and no measurement compares it to the one whose record the bot carries** | **open** | open by construction — registered 2026-08-28 by the change that caused it; the shadow baseline needs the vendor that ran out, which is why the switch happened |
+| 26 | **The operator's cost: gates charge a PINNED research block on every fill; live charges the console's current setting, and never on a short's opening order** | **open** | open by construction — registered 2026-10-28 by the change that caused it (the owner's after-cost decision); `tests/test_after_cost_backtest.py` pins the sim side, `tests/test_after_cost_rails.py` the live side |
 
 > **Rows 13–16 were missing from this table until 2026-08-06**, and this is the
 > second time this file has been wrong in the direction that matters. The prose
@@ -1289,3 +1291,57 @@ cycle that manages the open book.
 The EDGE tally is unchanged. `knowledge/backtest_candidates.md` owns that count.
 A cheaper judge that trades is not evidence of an edge; it is evidence of a bot
 that is running.
+
+
+## #26 — the gates and the live rails both read after-cost, but not the same cost
+
+**Opened 2026-10-28, by the change that caused it.** Owner decision, in his
+words: *"Yes: make gates, backtests and the drawdown/retire rails use after-cost
+results first (repete4's override included). Entry cost filters later, bot by
+bot."*
+
+Live charges every filled order the console's cost model
+(`operator_settings.py`), and since this decision the drawdown, daily-loss and
+live-kill rails and the decay monitor all read results after it. The simulator
+now charges the same formula (`cost_models.order_cost`, the verbatim copy) on
+every simulated fill, so the two agree about **what** a cost is. They do not
+agree about **which** cost, in three ways — all deliberate or inherited, none
+hidden:
+
+1. **The block.** A gate charges the block pinned in its spec
+   (`operator_costs:`; the research values, `cost_models.RECOMMENDED`, written
+   out in full), because a backtest that moved when someone changed a setting on
+   a web page would not be reproducible. Live charges whatever
+   `memory/operator_settings.json` says that cycle. **Direction:** depends on
+   the setting. At the research values (US$0.005/share, US$1 minimum, 1% cap)
+   they match. At the flat US$9/order the console started with (migration
+   0032), live pays ~5–9× what the gate assumed, so a gate verdict is
+   **optimistic** by the difference — which `operator_cost_paid_usd` on the
+   verdict row lets anyone compute.
+2. **Short opens.** `main.record_fill_quality` and adoption charge only
+   `action == "buy"` entries, so live never charges the order that opens a
+   short. The simulator charges every opening order, shorts included.
+   **Direction:** the sim is **pessimistic** for a short leg by one order's
+   cost. Inert today — nothing enabled shorts (xsmom ships `enabled: false`).
+   Recorded as a follow-up for the live side, not fixed here.
+3. **Timing inside a cycle.** Live charges a close the moment it books it, and
+   rail equity is computed once per cycle (refreshed after reconcile), so an
+   entry later in the same cycle's loop does not see a close charged earlier in
+   that loop until the next cycle. And if a cycle's rail equity is a new high,
+   the peak can sit above it by at most that cycle's reconcile costs until the
+   next high. The sim charges each fill as it happens. **Direction:** live is
+   conservative by at most one cycle's close costs (a few dollars) — never a
+   looser rail.
+
+Two things are **not** divergences, and are pinned so they cannot become one:
+sizing (both sides size on broker / gross equity; the cost never touches the
+sim's cash — `test_sizing_is_untouched_by_the_cost`) and the drawdown rail's
+equity (both measure after cost — `risk.rail_equity` live, `_rail_eq()` in both
+simulate paths, `test_the_sim_drawdown_rail_reads_after_cost_equity`).
+
+### What it invalidates
+
+Nothing retroactively. Every frozen spec predates the field, runs with no
+operator cost, and reproduces byte for byte (`run_gate.apply_operator_costs`
+removes any block config.yaml might carry). Gross verdicts stay gross verdicts:
+read them as **upper bounds** on what the after-cost bot would have scored.

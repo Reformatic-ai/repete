@@ -101,9 +101,17 @@ all — divergence #23. Read the shared-implementation guarantee as covering
 
 **Rail label** — which check refused an entry, recorded on the ledger decision:
 `datacheck` (the two price vendors disagree), `universe` (too few symbols have
-usable bars), `halt` (an operator halt in exits mode), `entry_drift`, and the
-named risk rails. **Exits are never blocked by a data rail** — a stranded
-position is worse than a missed entry.
+usable bars), `halt` (an operator halt in exits mode), `rail_equity_unknown`
+(the operator fee log could not be read, so every after-cost rail fails closed;
+2026-10-28), `entry_drift`, and the named risk rails. **Exits are never blocked
+by a data rail** — a stranded position is worse than a missed entry.
+
+**Rail equity** (§80, 2026-10-28) — broker equity minus the operator's
+simulated cost charged so far (`memory/operator_fees.jsonl`, read strictly).
+What the drawdown breaker, the daily-loss kill switch and their high-water mark
+measure. Broker equity stays the figure for sizing and for every record the
+console reads; the gates and the simulator measure the same after-cost basis
+from a cost block pinned in the spec (`operator_costs:`).
 
 **Degradation** — a ledger event meaning "a guard failed open and the cycle
 continued". Counted against `ops.max_degradations_per_day` (3), which is a

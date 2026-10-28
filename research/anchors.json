@@ -1260,6 +1260,21 @@
       ],
       "specs": [],
       "spec_source": "id+header+trailer"
+    },
+    {
+      "key": "§80",
+      "heading": "## §80 — GATES, BACKTESTS AND RAILS READ AFTER-COST RESULTS FIRST (DECISION, K stays closed at 16, 2026-10-28)",
+      "start_line": 7421,
+      "body_sha256": "1d012ac13e38bc57c3fead40a1303acd23a50a6986f50a771722d2f346c5b81f",
+      "subheadings": [
+        "### The decision, in the owner's words",
+        "### What changed",
+        "### What did not change",
+        "### The re-score: §43's pass mark, after cost",
+        "### Accounting"
+      ],
+      "specs": [],
+      "spec_source": "id+header+trailer"
     }
   ]
 }

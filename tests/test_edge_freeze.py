@@ -49,7 +49,12 @@ FROZEN = "data/snapshots/bars_wide_2000-01-01_2006-12-31.json.gz"
 
 
 def _spec(claim="EDGE", path=FROZEN):
+    # `operator_costs: false` since 2026-10-28: register_gate.py refuses a NEW
+    # spec that does not declare its operator cost (owner decision: gates read
+    # after-cost results first). These fixtures are about the freeze, so they
+    # declare it gross and the freeze stays the thing under test.
     return {"id": "sX", "claim": claim, "title": "t", "judge_model": True,
+            "operator_costs": False,
             "snapshot": {"path": path, "sha256": "0" * 64},
             "arms": [{"name": "baseline"}],
             "clauses": [{"id": "a", "rule": "min_trades", "n": 30}],

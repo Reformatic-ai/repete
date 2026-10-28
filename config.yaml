@@ -807,6 +807,10 @@ risk:                  # ---- HARD RAILS: enforced in deterministic code ----
     pf_below: 0.8                # profit factor < pf_below stops ENTERING (exits always
                                  # run). Registered while every strategy is far from the
                                  # threshold, so it cannot be argued with later.
+                                 # 2026-10-28 (owner decision: rails read after-cost
+                                 # results first): the PF is now AFTER each trade's own
+                                 # operator cost (joined on the fee log's ref). The three
+                                 # values above are UNCHANGED; only the P&L basis moved.
   sector_concentration:          # SECTOR CONCENTRATION CAP (2026-08-05, with `reclaim`).
     enabled: true                # At most `max_per_sector` open positions whose
     max_per_sector: 3            # symbol appears in the same `sectors:` entry.
@@ -1430,6 +1434,11 @@ publish:                # WHERE the public artifacts are written. One answer, so
 backtest:               # offline harness (src/backtest.py) — never touches the live ledger
   slippage_bps: 5       # applied against you on every simulated fill
   fee_per_trade_usd: 0.0
+  # operator_costs: DELIBERATELY ABSENT (2026-10-28). The console's operator
+  # cost model, charged on every simulated fill, comes from a block PINNED in a
+  # gate spec's top-level `operator_costs:` (run_gate.apply_operator_costs sets
+  # it, and REMOVES any copy found here). This file is not in any spec's hash,
+  # so a block here would silently re-score frozen gates. Absent = no cost.
   walk_forward_split: 0.7          # in-sample fraction; the rest is out-of-sample
   trials_path: research/trials.jsonl  # append-only log of EVERY variant tried.
                           # MOVED from memory/ 2026-08-22: memory/ is gitignored,

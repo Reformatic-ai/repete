@@ -292,6 +292,7 @@ def main() -> int:
         for line in gs.diff_fields(prior["spec"], spec):
             print(f"    {line}")
 
+
     # §52. Deliberately AFTER the already-registered-unchanged early return and
     # after the verdict check: an existing registration must stay re-runnable
     # and idempotent, and a moved goalpost must still report as a moved
@@ -311,6 +312,35 @@ def main() -> int:
         print("  §52 FREEZE OVERRIDDEN — recorded in the registration row:")
         print(f"    {reason}")
 
+    # Owner decision 2026-10-28, quoted exactly: "Yes: make gates, backtests and
+    # the drawdown/retire rails use after-cost results first (repete4's
+    # override included). Entry cost filters later, bot by bot."
+    #
+    # So a NEW claim must say what operator cost it charges, in the file, before
+    # any data is seen — judge_model's rule, and for its reason: a silent
+    # default is how §35-§41 came to be scored judge-less. Placed AFTER the
+    # already-registered-unchanged return, the verdict refusal and the freeze
+    # above, so every existing registration stays idempotent, every frozen hash
+    # stands, and a frozen venue still reports as a freeze; it binds only a
+    # spec being frozen now.
+    if "operator_costs" not in spec:
+        raise SystemExit(
+            f"REFUSING to register {args.spec_id}: it does not declare "
+            f"`operator_costs`.\n\n"
+            f"Owner decision 2026-10-28: gates read AFTER-COST results first. "
+            f"Add ONE of these at\nthe top level of "
+            f"{spec_path(args.spec_id)}:\n\n"
+            f"  operator_costs:       # the cost-models block, every market, "
+            f"every value\n"
+            f"    equities: {{model: per_share, flat_per_order: 1.0, "
+            f"per_share: 0.005,\n"
+            f"               min_per_order: 1.0, max_pct_of_value: 1.0}}\n"
+            f"    options:  {{...}}   fx: {{...}}   crypto: {{...}}   "
+            f"(cost_models.RECOMMENDED)\n"
+            f"  operator_costs: false # deliberately gross — say why in "
+            f"`prior`\n\n"
+            f"There is no default, for the reason judge_model has none.")
+
     os.makedirs(os.path.dirname(args.registrations) or ".", exist_ok=True)
     rec = {"id": args.spec_id, "spec_sha256": digest,
            "registered_at": datetime.now(timezone.utc).isoformat(),
@@ -326,6 +356,13 @@ def main() -> int:
     print(f"  prior  : {spec['prior'].strip().splitlines()[0][:72]}")
     print(f"  K      : {spec.get('bonferroni_k', 1)}")
     print(f"  judge  : {'ON — models the live 58% haircut' if spec['judge_model'] else 'OFF — deliberately judge-less'}")
+    _oc = spec["operator_costs"]
+    if isinstance(_oc, dict):
+        import cost_models
+        _oc_txt = f"ON — {cost_models.describe(_oc, 'equities')}"
+    else:
+        _oc_txt = "OFF — deliberately gross"
+    print(f"  cost   : {_oc_txt}")
     print("\nThe pass mark is now frozen. Run it with:")
     print(f"  python scripts/run_gate.py {args.spec_id}")
     return 0

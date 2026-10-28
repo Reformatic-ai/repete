@@ -95,8 +95,11 @@ def _charge_operator_fee(cfg: dict | None, ref: str, symbol: str, side: str,
     """Charge the operator's SIMULATED cost for one filled order.
 
     Appends to memory/operator_fees.jsonl (operator_settings.charge) and nothing
-    else: no order, cash, equity, sizing or rail sees it — the console subtracts
-    the running total from the equity it shows. `ref` is the console exporter's
+    else: no order, cash, broker equity or sizing sees it — the console subtracts
+    the running total from the equity it shows. Amended 2026-10-28 (owner
+    decision): the RAILS do see it, through that log — rail equity is broker
+    equity less the cost charged (_rail_equity), and the live kill and decay
+    monitor take each trade's own cost off its P&L. `ref` is the console exporter's
     transaction key for this order: "buy:<trade_id>" for a filled entry,
     "close:<trade_id>" for its close. Idempotent on ref. Uses the settings this
     cycle loaded in _bootstrap_cycle; a cfg without them charges nothing.
@@ -134,6 +137,87 @@ def _charge_operator_fee(cfg: dict | None, ref: str, symbol: str, side: str,
     except Exception as e:  # noqa: BLE001 — never block the trade it describes
         log.error("operator cost for %s not recorded: %s", ref, e)
         return 0.0
+
+
+# ---- rail equity (owner decision 2026-10-28) --------------------------------
+
+# The bot's day boundary for "cost charged before today": the market's calendar
+# day in New York, the day the broker's `last_equity` (previous close) closes.
+_ET = "America/New_York"
+
+
+def _day_start(now: datetime | None = None) -> datetime:
+    from zoneinfo import ZoneInfo
+    local = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo(_ET))
+    return local.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _rail_equity(cfg: dict, account: dict, now: datetime | None = None) -> str:
+    """Put this cycle's RAIL EQUITY on the account dict. Returns "" or the problem.
+
+    Owner decision 2026-10-28: "Yes: make gates, backtests and the
+    drawdown/retire rails use after-cost results first (repete4's override
+    included). Entry cost filters later, bot by bot."
+
+        rail_equity            = broker equity - every operator cost charged
+        rail_last_equity       = broker last_equity - the cost charged before
+                                 today (the daily-loss rail's day-start reference)
+        operator_cost_charged  = the cost charged so far (the one-time move of a
+                                 legacy gross peak, risk.update_high_water)
+
+    `equity` and `last_equity` stay the BROKER's (invariant #4): sizing, the caps
+    and every record the console reads use them, and the console nets the cost
+    off itself — taking it off here as well would count it twice.
+
+    The fee log is read STRICTLY (operator_settings.rail_totals). A missing file
+    is 0. An unreadable file, a torn line or a line in another currency sets
+    rail_equity to None and returns the reason: the rails then fail CLOSED
+    (risk.pure_checks, risk.live_kill_blocked, the cycle's entry block) — never
+    0, which would be the one wrong answer that flatters every rail. Never
+    raises."""
+    try:
+        whole, before = operator_settings.rail_totals(
+            statepaths.operator_dir(cfg), _day_start(now),
+            currency=operator_settings.CURRENCY)
+    except operator_settings.FeeLedgerError as e:
+        account[risk.RAIL_EQUITY_KEY] = None
+        account[risk.RAIL_LAST_EQUITY_KEY] = None
+        account[risk.COST_CHARGED_KEY] = None
+        account[risk.RAIL_PROBLEM_KEY] = str(e)
+        return str(e)
+    account[risk.RAIL_EQUITY_KEY] = round(float(account["equity"]) - whole, 4)
+    account[risk.RAIL_LAST_EQUITY_KEY] = round(
+        float(account["last_equity"]) - before, 4)
+    account[risk.COST_CHARGED_KEY] = whole
+    account[risk.RAIL_PROBLEM_KEY] = ""
+    return ""
+
+
+def _rail_fail_closed(ledger: Ledger, problem: str) -> None:
+    """The fee log could not be read: say so loudly, once per cycle. The entry
+    block itself is in _run_cycle and in the rails. Never raises."""
+    msg = (f"operator fee ledger unreadable — rail equity unknown, entries "
+           f"blocked this cycle (the rails fail CLOSED; exits still run): "
+           f"{problem}")
+    log.critical("%s", msg)
+    try:
+        ledger.log_event("rail_equity_unknown", msg[:500])
+    except Exception:  # noqa: BLE001 — observability never blocks a cycle
+        pass
+    try:
+        import alerting
+        alerting.send("Repete: operator fee ledger unreadable", msg)
+    except Exception:  # noqa: BLE001 — alerting never blocks a cycle
+        pass
+
+
+def _fees_for_rules(cfg: dict) -> tuple[dict | None, str]:
+    """(ref -> fee, "") for the outcome-based rules, or (None, problem) when the
+    fee log cannot be read strictly. Never raises."""
+    try:
+        return operator_settings.fees_by_ref(statepaths.operator_dir(cfg)), ""
+    except operator_settings.FeeLedgerError as e:
+        return None, str(e)
 
 
 def handle_close(trade_id: str, open_rec: dict, exit_price: float,
@@ -180,7 +264,11 @@ def handle_close(trade_id: str, open_rec: dict, exit_price: float,
                        exit_reason=exit_reason, benchmark_pnl_pct=bench_pct)
     # The closing order pays the operator's simulated cost (its exporter row is
     # "close:<trade_id>"). Not part of pnl above: the outcome record stays the
-    # strategy's result, and the console nets the cost off displayed equity.
+    # strategy's GROSS result, and the console nets the cost off displayed
+    # equity. Amended 2026-10-28 (owner decision): the outcome-based rules (live
+    # kill, decay monitor) now take this trade's own cost off that P&L when they
+    # read it, joined on the fee line's ref (risk.after_cost_trades); the record
+    # is not rewritten.
     # The close is the whole position, so shares = the ledger record's qty (no
     # fallback: a record without one is logged by the charge, not guessed).
     # exit_price is the broker's fill when a reconcile found one (a filled leg or
@@ -962,8 +1050,8 @@ def check_degradation_slo(ledger: Ledger, cfg: dict):
         log.warning("SLO check failed: %s", e)
 
 
-def _bootstrap_cycle():
-    """Config, preflight, stores, HALT check, broker state.
+def _bootstrap_cycle(charge_fills: bool = False):
+    """Config, preflight, stores, HALT check, broker state, rail equity.
 
     Returns `(cfg, ledger, memory, broker, account, positions, halted)`, or
     **None** when the cycle must not proceed — a preflight failure or a HALT in
@@ -974,6 +1062,12 @@ def _bootstrap_cycle():
     `halted` is True under a HALT in `exits` mode: the cycle RUNS, works its
     exits, and opens nothing. See risk.halt_mode for why the two are separate
     instructions rather than one flag.
+
+    `account` also carries this cycle's RAIL EQUITY (2026-10-28, _rail_equity):
+    broker equity less the operator cost charged so far, which the drawdown,
+    daily-loss and live-kill rails read. `charge_fills=True` (the full cycle)
+    charges the confirmed entry fills first (record_fill_quality), so the
+    figure includes them.
 
     Extracted from `_run_cycle` in W4-7 (2026-07-29).
     """
@@ -1124,6 +1218,17 @@ def _bootstrap_cycle():
         except Exception:  # noqa: BLE001
             pass
         return None
+
+    # RAIL EQUITY, ONCE, right after the broker read (owner decision 2026-10-28).
+    # A full cycle first charges the entry fills it can now confirm, so the
+    # rails below see this cycle's costs rather than last cycle's: those fills
+    # were already in the broker equity just read. (Broker-side closes are
+    # charged in reconcile, after the first kill-switch check; _run_cycle
+    # refreshes rail equity and re-checks once they are in.) swing_scan does not
+    # charge fills — it confirms none — and reads the same figure.
+    if charge_fills:
+        record_fill_quality(broker, ledger, cfg=cfg)
+    _rail_equity(cfg, account)
 
     return cfg, ledger, memory, broker, account, positions, halted
 
@@ -1497,8 +1602,14 @@ def _finalize_cycle(cfg: dict, ledger: Ledger, memory, broker, account: dict,
         log.warning("positions mark failed: %s", e)
 
     import json as _json
+    # `equity` stays the BROKER's: the console reads it and nets the operator
+    # cost off itself. `rail_equity` (2026-10-28) is the after-cost figure the
+    # rails measured this cycle — None when the fee log was unreadable — so
+    # health and the watchdog report the drawdown on the rail's own basis.
     ledger.log_event("cycle_complete",
                      _json.dumps({"equity": account["equity"],
+                                  "rail_equity": account.get(
+                                      risk.RAIL_EQUITY_KEY, account["equity"]),
                                   "n_positions": len(positions),
                                   "regime": regime_label,
                                   "sha": _deploy.get("sha"),
@@ -1512,7 +1623,10 @@ def _finalize_cycle(cfg: dict, ledger: Ledger, memory, broker, account: dict,
     # sits outside its contract exactly as cycle_timing does. Never raises.
     import handoff
     handoff.record(ledger, cfg, equity=account["equity"],
-                   n_positions=len(positions))
+                   n_positions=len(positions),
+                   rail_equity=account.get(risk.RAIL_EQUITY_KEY,
+                                           account["equity"]),
+                   rail_problem=account.get(risk.RAIL_PROBLEM_KEY) or "")
 
     # Degradation SLO: too many fail-open events in one day means the ops
     # error budget is burned — escalate to a human (alert only; HALT stays
@@ -1568,7 +1682,7 @@ def _log_operator_settings(ledger: Ledger, cfg: dict) -> None:
 
 
 def _run_cycle(completed_bars_only: bool = False):
-    started = _bootstrap_cycle()
+    started = _bootstrap_cycle(charge_fills=True)
     if started is None:
         return
     cfg, ledger, memory, broker, account, positions, halted = started
@@ -1603,12 +1717,35 @@ def _run_cycle(completed_bars_only: bool = False):
     # to do. `pre_trade_checks` still ratchets per order; this is not a
     # replacement for it but the floor under it, and update_high_water is
     # idempotent-by-max so running both is a no-op on the second call.
-    if cfg["risk"].get("max_drawdown_pct"):
-        _peak = risk.update_high_water(account["equity"])
-        log.info("Equity peak: $%.2f (drawdown %.2f%%)",
-                 _peak, risk.drawdown_pct(account["equity"], _peak))
+    #
+    # AFTER COST since 2026-10-28 (owner decision): the mark is kept on RAIL
+    # equity (broker equity less the operator cost charged so far, computed once
+    # in _bootstrap_cycle after this cycle's confirmed entry fills were
+    # charged). The first run of this code moves a legacy GROSS peak once, to
+    # peak - the cost charged so far, and stamps the file `basis: after_cost` so
+    # a rerun cannot move it again (see update_high_water). Unknown rail equity
+    # (the fee log could not be read) writes nothing: the rails fail CLOSED.
+    #
+    # Residual, stated rather than hidden: reconcile/adoption below may charge
+    # close and adoption costs AFTER this ratchet. If this cycle's rail equity
+    # was a new high, the mark then sits above it by at most those costs, until
+    # the next new high — the conservative direction (a drawdown read a few
+    # dollars deep), never a looser rail. Moving the ratchet past reconcile
+    # would let the kill-switch cycle skip it (see test_quiet_cycle_...).
+    rail_problem = account.get(risk.RAIL_PROBLEM_KEY) or ""
+    if rail_problem:
+        _rail_fail_closed(ledger, rail_problem)
+    if cfg["risk"].get("max_drawdown_pct") and not rail_problem:
+        _peak = risk.update_high_water(risk.rail_equity(account),
+                                       cost_charged=account.get(
+                                           risk.COST_CHARGED_KEY),
+                                       gross_equity=account["equity"])
+        log.info("Equity peak (after operator cost): $%.2f (drawdown %.2f%% "
+                 "on rail equity $%.2f; broker equity $%.2f)", _peak,
+                 risk.drawdown_pct(risk.rail_equity(account), _peak),
+                 risk.rail_equity(account), account["equity"])
 
-    # --- Kill switch: daily loss limit ---
+    # --- Kill switch: daily loss limit (on rail equity) ---
     if _kill_switch_fired(broker, ledger, account, cfg):
         return
 
@@ -1619,7 +1756,22 @@ def _run_cycle(completed_bars_only: bool = False):
     # crash between order submit and the ledger write — adopt it so it is
     # tracked before we read open trades below.
     adopt_untracked_positions(broker, ledger, cfg, positions)
-    record_fill_quality(broker, ledger, cfg=cfg)
+    # (record_fill_quality ran in _bootstrap_cycle, before the rails, so the
+    # entry fills it charges are already in rail equity.)
+
+    # Reconcile and adoption charge the costs of fills that happened at the
+    # broker since the last cycle — fills already in the broker equity read at
+    # bootstrap. Refresh rail equity so the entry rails below see this cycle's
+    # costs now, not one run late, and re-ask the daily-loss question if they
+    # moved it.
+    if not rail_problem:
+        _before = account.get(risk.COST_CHARGED_KEY)
+        rail_problem = _rail_equity(cfg, account)
+        if rail_problem:
+            _rail_fail_closed(ledger, rail_problem)
+        elif (account.get(risk.COST_CHARGED_KEY) != _before
+              and _kill_switch_fired(broker, ledger, account, cfg)):
+            return
 
     open_trades = ledger.open_buys()    # trade_id -> record, for closing P&L
     # Before anything reads a stop off these records (the heat cap, the exit
@@ -1873,8 +2025,13 @@ def _run_cycle(completed_bars_only: bool = False):
 
         try:
             if sig.action in ENTRY_ACTIONS:
+                # After cost (2026-10-28): each trade's own operator cost off
+                # its P&L, read fresh so a close charged earlier in this cycle
+                # counts. Unreadable fee log -> the kill fails CLOSED.
+                _fees, _fees_problem = _fees_for_rules(cfg)
                 kill = risk.live_kill_blocked(ledger.closed_trades(),
-                                              sig.strategy, cfg)
+                                              sig.strategy, cfg, fees=_fees,
+                                              fees_problem=_fees_problem)
                 if kill:
                     raise risk.RiskRejection(kill, rail="live_kill")
             risk.pre_trade_checks(sig.action, symbol, qty, price, account,
@@ -2150,6 +2307,18 @@ def _run_cycle(completed_bars_only: bool = False):
         entries_blocked_reason = ("HALT engaged (exits mode) — entries blocked, "
                                   "exits still run")
         entries_blocked_rail = "halt"
+    elif rail_problem:
+        # 2026-10-28: rail equity is unknown because the operator fee log could
+        # not be read strictly. The daily-loss, drawdown and live-kill rails all
+        # read after-cost figures now, so none of them can clear an entry: the
+        # whole cycle's entries fail CLOSED, through the same inline block the
+        # vendor divergence uses (exits untouched). Alerted once in
+        # _rail_fail_closed.
+        entries_blocked_reason = ("operator fee ledger unreadable — rail "
+                                  "equity unknown, entries blocked (the rails "
+                                  "fail CLOSED); exits still run: "
+                                  + rail_problem)
+        entries_blocked_rail = "rail_equity_unknown"
 
     # Chandelier trail maintenance (param-gated; no-op while mult is 0).
     update_trailing_stops(broker, ledger, cfg, open_trades, all_bars)

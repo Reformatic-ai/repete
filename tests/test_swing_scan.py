@@ -320,6 +320,28 @@ def test_a_halted_bot_scans_nothing(monkeypatch):
     assert broker.orders == []
 
 
+def test_an_unreadable_fee_ledger_fails_the_scan_closed(monkeypatch):
+    """2026-10-28 (owner decision: the rails read after-cost results). The
+    bootstrap could not read the operator fee log, so rail equity is unknown:
+    no rail can clear an entry, and this module only enters. Same fixture as
+    the in-zone entry above, which DOES place an order — so the stop here is
+    the ledger, not the fixture."""
+    cfg, bars = scan_cfg(), etf_bars()
+    broker = FakeBroker({"XLE": in_zone_price(bars, cfg)})
+    ledger, memory, calls = wire(monkeypatch, cfg, bars, broker)
+    account = {"equity": 100_000.0, "buying_power": 200_000.0,
+               "cash": 100_000.0, "rail_equity": None,
+               "rail_problem": "operator_fees.jsonl line 3 is torn"}
+    monkeypatch.setattr(swing_scan.cycle, "_bootstrap_cycle",
+                        lambda: (cfg, ledger, memory, broker, account, {},
+                                 False))
+    assert swing_scan.run_scan() == 0
+    assert broker.orders == [] and calls["rails"] == []
+    assert ("swing_scan_entries_blocked",
+            "rail_equity_unknown: operator_fees.jsonl line 3 is torn"
+            ) in ledger.events
+
+
 # --------------------------------------------------------- module discipline
 
 def test_the_scan_has_no_exit_path():

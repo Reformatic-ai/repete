@@ -178,7 +178,10 @@ def _enter(cand: dict, live: float, cfg, ledger, memory, broker, account,
         return "blocked"
 
     try:
-        kill = risk.live_kill_blocked(ledger.closed_trades(), STRATEGY, cfg)
+        # After cost (2026-10-28), joined on each trade's own fee lines.
+        _fees, _fees_problem = cycle._fees_for_rules(cfg)
+        kill = risk.live_kill_blocked(ledger.closed_trades(), STRATEGY, cfg,
+                                      fees=_fees, fees_problem=_fees_problem)
         if kill:
             raise risk.RiskRejection(kill, rail="live_kill")
         # `bars_map=all_bars` — the FULL fetch, which run_scan sized to the
@@ -297,6 +300,16 @@ def run_scan() -> int:
                                           # opens; there is nothing for it to do
     params = strategies.strategy_params(cfg, STRATEGY)
     if params is None:
+        return 0
+    if account.get(risk.RAIL_PROBLEM_KEY):
+        # 2026-10-28: the operator fee log could not be read strictly, so rail
+        # equity is unknown and every after-cost rail fails CLOSED. This module
+        # only opens, so the pass is over — said once, as the cycle does.
+        log.critical("rail equity unknown — scan pass over: %s",
+                     account[risk.RAIL_PROBLEM_KEY])
+        ledger.log_event("swing_scan_entries_blocked",
+                         f"rail_equity_unknown: "
+                         f"{account[risk.RAIL_PROBLEM_KEY]}"[:300])
         return 0
 
     try:

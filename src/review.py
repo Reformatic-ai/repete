@@ -336,9 +336,26 @@ def main():
               f"{kcfg.get('pf_below', 0.8)} over >= "
               f"{kcfg.get('min_trades', 15)} live closed trades "
               f"retires a strategy's entries):")
+        # After the operator cost, exactly as the rail reads it (2026-10-28):
+        # each trade's own cost off its P&L. Strict read; an unreadable fee
+        # log is shown as the fail-closed state the rail is in.
+        fees, fees_problem = None, ""
+        try:
+            import operator_settings
+            import statepaths
+            fees = operator_settings.fees_by_ref(statepaths.operator_dir(cfg))
+        except Exception as e:  # noqa: BLE001 — FeeLedgerError; a report never dies
+            fees_problem = str(e)
+            print(f"  (operator fee ledger unreadable — the live kill fails "
+                  f"CLOSED: {fees_problem})")
+        print("  (PF after each trade's own operator cost)")
+        stats_trades = (risk_mod.after_cost_trades(closed_all, fees)
+                        if fees else closed_all)
         for strat in strategies_seen:
-            s = risk_mod.strategy_live_stats(closed_all, strat)
-            killed = risk_mod.live_kill_blocked(closed_all, strat, cfg)
+            s = risk_mod.strategy_live_stats(stats_trades, strat)
+            killed = risk_mod.live_kill_blocked(closed_all, strat, cfg,
+                                                fees=fees,
+                                                fees_problem=fees_problem)
             pf_txt = ("n/a" if s["pf"] is None
                       else "inf" if s["pf"] == float("inf")
                       else f"{s['pf']:.2f}")

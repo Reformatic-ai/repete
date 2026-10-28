@@ -315,23 +315,111 @@ def read_high_water() -> float:
         return _PEAK_UNKNOWN          # fail CLOSED
 
 
-def update_high_water(equity: float) -> float:
+# ---- RAIL EQUITY (owner decision 2026-10-28) --------------------------------
+#
+# "Yes: make gates, backtests and the drawdown/retire rails use after-cost results
+# first (repete4's override included). Entry cost filters later, bot by bot."
+#
+# The drawdown breaker, the daily-loss kill switch and the live kill measure the
+# book AFTER the operator's simulated cost: rail equity = broker equity - every
+# cost charged so far (memory/operator_fees.jsonl, read strictly). Broker equity
+# stays the figure for sizing, the caps and every record the console reads — the
+# console nets the cost off itself, and doing it here too would count it twice.
+#
+# main._rail_equity computes it ONCE per cycle, right after the broker read, and
+# puts it on the cycle's account dict under RAIL_EQUITY_KEY. A dict without the key
+# (the simulator before it charges anything, tests, a caller that predates the
+# decision) has no operator cost, so rail equity IS broker equity. A key whose value
+# is None means the fee ledger could not be read: the rails fail CLOSED.
+RAIL_EQUITY_KEY = "rail_equity"
+RAIL_LAST_EQUITY_KEY = "rail_last_equity"
+COST_CHARGED_KEY = "operator_cost_charged"
+RAIL_PROBLEM_KEY = "rail_problem"
+
+
+def rail_equity(account: dict) -> float | None:
+    """The equity the drawdown / daily-loss rails measure. None = unknown."""
+    if RAIL_EQUITY_KEY in account:
+        v = account[RAIL_EQUITY_KEY]
+        return None if v is None else float(v)
+    return float(account["equity"])
+
+
+# The basis the stored peak is measured on. A file without it holds a GROSS peak
+# written before 2026-10-28; update_high_water moves it once (see there).
+HIGHWATER_BASIS = "after_cost"
+
+
+def _high_water_record() -> dict | None:
+    """The peak file as written, {} when it does not exist, None when unreadable."""
+    try:
+        with open(_HIGHWATER_FILE) as f:
+            rec = json.load(f)
+        return rec if isinstance(rec, dict) else None
+    except FileNotFoundError:
+        return {}
+    except (json.JSONDecodeError, ValueError, OSError):
+        return None
+
+
+def high_water_basis() -> str | None:
+    """`after_cost`, or None for a legacy gross peak / no file / unreadable."""
+    rec = _high_water_record()
+    return (rec or {}).get("basis")
+
+
+def update_high_water(equity: float, *, cost_charged: float | None = None,
+                      gross_equity: float | None = None) -> float:
     """Ratchet the peak upward and persist it. Returns the current peak.
 
     Never ratchets DOWN: a drawdown rail measured against a peak that follows
     equity downward would never fire, which is the failure mode of every
     trailing metric that forgets to keep its high-water mark.
+
+    `equity` is RAIL equity (after the operator's cost) since 2026-10-28.
+
+    THE ONE-TIME MOVE. A peak file written before that decision holds a GROSS
+    peak and no `basis`. The first call that knows the cost charged so far
+    (`cost_charged`, which main passes every cycle) moves it once to
+    `peak - cost_charged`, stamps `"basis": "after_cost"` and keeps the gross
+    figure and the amount it moved by beside it, so the move is auditable and a
+    rerun is a no-op: a stamped file is never moved again. A call without
+    `cost_charged` cannot move a gross peak and leaves it unstamped, so the move
+    can never be skipped by a caller that did not know the cost.
+
+    `gross_equity` (broker equity) ratchets `peak_equity_gross` alongside, for
+    the before-cost drawdown health shows. Display only: no rail reads it.
     """
+    rec = _high_water_record()
     peak = read_high_water()
-    if peak is _PEAK_UNKNOWN or peak == _PEAK_UNKNOWN:
-        peak = 0.0                    # corrupt: reseed from live equity below
+    if rec is None or peak is _PEAK_UNKNOWN or peak == _PEAK_UNKNOWN:
+        peak, rec = 0.0, {}           # corrupt: reseed from live equity below
+    out = {k: v for k, v in rec.items()
+           if k in ("basis", "peak_equity_gross", "moved_from_gross",
+                    "moved_by_cost", "moved_at")}
+    if not rec:
+        out["basis"] = HIGHWATER_BASIS          # seeded on the new basis
+    elif rec.get("basis") != HIGHWATER_BASIS and cost_charged is not None:
+        gross_peak = peak
+        peak = gross_peak - float(cost_charged)
+        out.update(basis=HIGHWATER_BASIS, peak_equity_gross=gross_peak,
+                   moved_from_gross=gross_peak,
+                   moved_by_cost=round(float(cost_charged), 4),
+                   moved_at=datetime.now(timezone.utc).isoformat())
+        log.warning("equity high-water moved to the after-cost basis once: "
+                     "$%.2f - $%.2f operator cost = $%.2f",
+                     gross_peak, float(cost_charged), peak)
     peak = max(peak, float(equity))
+    if gross_equity is not None:
+        out["peak_equity_gross"] = max(float(out.get("peak_equity_gross") or 0.0),
+                                       float(gross_equity))
     os.makedirs(os.path.dirname(_HIGHWATER_FILE), exist_ok=True)
     tmp = f"{_HIGHWATER_FILE}.tmp{os.getpid()}"
     try:
         with open(tmp, "w") as f:
             json.dump({"peak_equity": peak,
-                       "updated": datetime.now(timezone.utc).isoformat()}, f)
+                       "updated": datetime.now(timezone.utc).isoformat(),
+                       **out}, f)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, _HIGHWATER_FILE)
@@ -355,7 +443,11 @@ def drawdown_pct(equity: float, peak: float) -> float:
     return max(0.0, (peak - equity) / peak * 100)
 
 
-def drawdown_state(equity: float | None, limit_pct: float) -> dict:
+_SAME_AS_EQUITY = object()
+
+
+def drawdown_state(equity: float | None, limit_pct: float, *,
+                   rail_equity=_SAME_AS_EQUITY, rail_problem: str = "") -> dict:
     """Read-only view of the drawdown circuit breaker. NEVER writes.
 
     Why this exists (2026-08-03)
@@ -389,10 +481,25 @@ def drawdown_state(equity: float | None, limit_pct: float) -> dict:
 
     `equity=None` means "not known" and is reported as such — an unknown
     drawdown must never read as a healthy one.
+
+    BEFORE AND AFTER COST (owner decision 2026-10-28). `equity` is broker
+    equity; `rail_equity` is broker equity less the operator cost charged so far
+    — what the rail actually measures. Omitted, it is `equity` (no cost known).
+    `drawdown_pct`, `headroom_pp` and `engaged` are the RAIL's view: after cost
+    once the peak file carries `basis: after_cost`, gross while it is still a
+    legacy gross peak (the live rail has not moved it yet, so gross against gross
+    is what it is measuring). `drawdown_gross_pct` is broker equity against the
+    gross peak, for display. `rail_equity=None` with `rail_problem` means the fee
+    ledger could not be read: reported ENGAGED, because the live rail fails
+    closed on exactly that.
     """
     out = {"known": False, "engaged": False, "equity": None, "peak_equity": None,
            "drawdown_pct": None, "limit_pct": float(limit_pct or 0),
-           "headroom_pp": None, "note": ""}
+           "headroom_pp": None, "note": "",
+           "basis": None, "rail_equity": None, "peak_equity_gross": None,
+           "drawdown_gross_pct": None}
+    if rail_equity is _SAME_AS_EQUITY:
+        rail_equity = equity
 
     if not limit_pct:
         out["note"] = "rail disabled (max_drawdown_pct: 0)"
@@ -403,8 +510,11 @@ def drawdown_state(equity: float | None, limit_pct: float) -> dict:
         return out
 
     peak = read_high_water()
+    rec = _high_water_record() or {}
     out["known"] = True
     out["equity"] = float(equity)
+    out["basis"] = rec.get("basis") or "gross (legacy, not yet moved)"
+    after_cost = rec.get("basis") == HIGHWATER_BASIS
 
     # Polarity matches read_high_water's own: an unreadable peak fails CLOSED,
     # because we do not know how far below it we are. Reported as engaged so
@@ -417,6 +527,21 @@ def drawdown_state(equity: float | None, limit_pct: float) -> dict:
         return out
 
     out["peak_equity"] = float(peak)
+    gross_peak = rec.get("peak_equity_gross") if after_cost else peak
+    if isinstance(gross_peak, (int, float)) and gross_peak > 0:
+        out["peak_equity_gross"] = float(gross_peak)
+        out["drawdown_gross_pct"] = round(drawdown_pct(equity, gross_peak), 2)
+    if after_cost:
+        if rail_equity is None:
+            # The fee ledger is unreadable, so after-cost equity is unknown. The
+            # live rail fails CLOSED on exactly this, and so does the report.
+            out["engaged"] = True
+            out["note"] = ("operator fee ledger unreadable — rail equity "
+                           "unknown, the rail fails CLOSED"
+                           + (f" ({rail_problem})" if rail_problem else ""))
+            return out
+        out["rail_equity"] = float(rail_equity)
+        equity = float(rail_equity)
     if peak <= 0:
         # Never seeded: first run, no peak to be below. Not a drawdown.
         out["drawdown_pct"] = 0.0
@@ -508,12 +633,31 @@ def decayed_peak(peak: float, equity: float, bars_stable: int,
 
 
 def daily_loss_breached(account: dict, cfg: dict) -> bool:
-    """True if today's P&L is below the configured loss limit."""
+    """True if today's P&L is below the configured loss limit.
+
+    AFTER COST since 2026-10-28 (owner decision): today's rail equity (broker
+    equity - every operator cost charged so far) against the day-start reference
+    (the broker's `last_equity` - the cost charged BEFORE today, by the bot's day
+    boundary; main._rail_equity puts both on the account). An account without
+    them has no operator cost and reads exactly as before.
+
+    Unknown rail equity (the fee ledger could not be read) falls back to GROSS
+    here, never to "no breach": today's after-cost loss is the gross loss plus
+    today's fees over a smaller base, so a gross breach is always an after-cost
+    breach and this can under-fire but never over-fire. The cycle separately
+    fails CLOSED on entries and alerts (main._rail_equity) — the flatten is not
+    the right act for a bookkeeping file, the entry block is.
+    """
     limit_pct = cfg["risk"]["daily_loss_limit_pct"]
     last = account["last_equity"]
+    equity = account["equity"]
+    rail_eq = rail_equity(account)
+    rail_last = account.get(RAIL_LAST_EQUITY_KEY)
+    if rail_eq is not None and rail_last is not None:
+        equity, last = rail_eq, float(rail_last)
     if last <= 0:
         return False
-    pnl_pct = (account["equity"] - last) / last * 100
+    pnl_pct = (equity - last) / last * 100
     if pnl_pct <= -limit_pct:
         log.critical("Daily loss limit breached: %.2f%% (limit -%.2f%%)", pnl_pct, limit_pct)
         return True
@@ -1221,24 +1365,71 @@ def strategy_live_stats(closed_trades: list[dict], strategy: str) -> dict:
     return {"n": len(trades), "pf": pf}
 
 
+def after_cost_trades(closed_trades: list[dict], fees: dict) -> list[dict]:
+    """Each closed trade with its OWN operator cost taken off its P&L. Pure.
+
+    Owner decision 2026-10-28: outcome-based rules read after-cost results. A
+    trade's cost is the fee charged on its entry fill plus its close, joined on
+    the fee line's `ref` ("buy:<trade_id>", "close:<trade_id>" —
+    operator_settings.trade_cost). `pnl` and `pnl_pct` are replaced (pnl_pct on
+    the same entry notional the ledger used); `pnl_gross` keeps the strategy's
+    own figure. The ledger record itself is never rewritten. `fees` empty is the
+    identity, so a book with no operator cost reads exactly as before."""
+    out = []
+    for t in closed_trades:
+        tid = t.get("trade_id")
+        cost = round(fees.get(f"buy:{tid}", 0.0)
+                     + fees.get(f"close:{tid}", 0.0), 4) if tid else 0.0
+        if not cost:
+            out.append(t)
+            continue
+        u = dict(t)
+        u["pnl_gross"] = t.get("pnl")
+        u["operator_cost"] = cost
+        if isinstance(t.get("pnl"), (int, float)):
+            u["pnl"] = round(float(t["pnl"]) - cost, 4)
+        notional = abs(float(t.get("entry_price") or 0) * float(t.get("qty") or 0))
+        if isinstance(t.get("pnl_pct"), (int, float)) and notional > 0:
+            u["pnl_pct"] = float(t["pnl_pct"]) - cost / notional * 100
+        out.append(u)
+    return out
+
+
 def live_kill_blocked(closed_trades: list[dict], strategy: str | None,
-                      cfg: dict) -> str | None:
+                      cfg: dict, *, fees: dict | None = None,
+                      fees_problem: str = "") -> str | None:
     """Pre-registered live kill criteria (2026-07-21, enterprise-hardening):
     the live-side mirror of the backtest enablement gate. A strategy whose
     LIVE record over >= min_trades closed trades shows PF < pf_below stops
     ENTERING (exits always still run). Registered before any strategy is
     near the threshold, so it can't be argued with later. Returns the
-    rejection reason, or None."""
+    rejection reason, or None.
+
+    AFTER COST since 2026-10-28 (owner decision). The criteria — min_trades and
+    pf_below, config.yaml risk.live_kill — are UNCHANGED; only the P&L they read
+    moved: each trade's own operator cost comes off it (after_cost_trades, joined
+    on `ref`). `fees` is operator_settings.fees_by_ref(); None means no cost was
+    supplied (reports, and callers that predate the decision). `fees_problem` set
+    means the fee ledger could not be read: an enabled kill then fails CLOSED and
+    refuses the entry, because an after-cost PF it cannot compute is not a pass.
+    """
     kcfg = cfg["risk"].get("live_kill") or {}
     if not kcfg.get("enabled") or not strategy:
         return None
+    if fees_problem:
+        return (f"live kill fails CLOSED: the operator fee ledger is unreadable "
+                f"({fees_problem}), so {strategy}'s after-cost record cannot be "
+                f"computed — entries refused, exits unaffected")
+    if fees:
+        closed_trades = after_cost_trades(closed_trades, fees)
     s = strategy_live_stats(closed_trades, strategy)
     min_trades = int(kcfg.get("min_trades", 15))
     pf_below = float(kcfg.get("pf_below", 0.8))
     if s["n"] >= min_trades and s["pf"] is not None and s["pf"] < pf_below:
-        return (f"live kill: {strategy} PF {s['pf']:.2f} over {s['n']} live "
-                f"closed trades is below {pf_below} (pre-registered criteria "
-                f"— entries retired, exits unaffected)")
+        basis = " after operator cost" if fees else ""
+        return (f"live kill: {strategy} PF {s['pf']:.2f}{basis} over {s['n']} "
+                f"live closed trades is below {pf_below} (pre-registered "
+                f"criteria — entries retired, exits unaffected)")
     return None
 
 
@@ -1360,9 +1551,23 @@ def pure_checks(action: str, symbol: str, qty: int, price: float,
         # hard one — it flattens the book and engages HALT. Two different acts
         # for two different situations, deliberately not merged: a slow bleed to
         # -10% over weeks should stop new entries, not liquidate at the bottom.
+        #
+        # AFTER COST since 2026-10-28 (owner decision): measured on RAIL equity
+        # (rail_equity: broker equity - the operator cost charged so far),
+        # against a peak kept on the same basis. The simulator puts its own
+        # after-cost equity under the same key, so the two cannot disagree
+        # about which equity a drawdown is measured on. Unknown rail equity
+        # (the fee ledger could not be read) fails CLOSED, exactly as an
+        # unreadable peak does.
         dd_cap = r.get("max_drawdown_pct") or 0
         if dd_cap and peak_equity is not None:
-            dd = drawdown_pct(account["equity"], peak_equity)
+            r_eq = rail_equity(account)
+            if r_eq is None:
+                raise RiskRejection(
+                    "drawdown circuit breaker fails CLOSED: the operator fee "
+                    "ledger is unreadable, so after-cost equity is unknown — "
+                    "entries blocked, exits still run", rail="drawdown")
+            dd = drawdown_pct(r_eq, peak_equity)
             if dd >= dd_cap:
                 raise RiskRejection(
                     f"drawdown circuit breaker: {dd:.2f}% from peak "
@@ -1625,7 +1830,9 @@ def rail_census(action: str, symbol: str, qty: int, price: float,
     if entry:
         dd_cap = r.get("max_drawdown_pct") or 0
         if dd_cap and peak_equity is not None:
-            out["drawdown"] = drawdown_pct(account["equity"], peak_equity) >= dd_cap
+            r_eq = rail_equity(account)
+            out["drawdown"] = (r_eq is None
+                               or drawdown_pct(r_eq, peak_equity) >= dd_cap)
 
         max_open = r["max_open_positions"]
         out["max_open_positions"] = (
@@ -1745,9 +1952,20 @@ def pre_trade_checks(action: str, symbol: str, qty: int, price: float,
     # reads as a drawdown, and so a corrupt file self-heals within one cycle.
     # Runs for sells too — the peak must keep tracking even while entries are
     # blocked, otherwise the breaker could never clear itself.
+    #
+    # On RAIL equity (after the operator cost) since 2026-10-28, with the cost
+    # charged so far passed along so a legacy gross peak is moved first, never
+    # ratcheted on the wrong basis. Unknown rail equity writes nothing: the
+    # stored peak is READ and pure_checks fails the entry closed.
     peak_equity = None
     if cfg["risk"].get("max_drawdown_pct"):
-        peak_equity = update_high_water(account["equity"])
+        r_eq = rail_equity(account)
+        if r_eq is None:
+            peak_equity = read_high_water()
+        else:
+            peak_equity = update_high_water(
+                r_eq, cost_charged=account.get(COST_CHARGED_KEY),
+                gross_equity=account.get("equity"))
 
     pure_checks(action, symbol, qty, price, account, positions, cfg,
                 regime_label=regime_label, strategy=strategy,

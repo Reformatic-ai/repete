@@ -56,6 +56,10 @@ def _spec(**over):
         # carries it. Every spec frozen from 2026-07-29 onward declares whether
         # it models the judge; §35-§41 predate the field and omit it.
         "judge_model": True,
+        # 2026-10-28: likewise refused without its operator cost declared
+        # (owner decision: gates read after-cost results first). Declared
+        # gross here; this file is about re-registration, not cost.
+        "operator_costs": False,
         "arms": [{"name": "baseline"},
                  {"name": "cand", "set": {"risk.max_trades_per_day": 10}}],
         "clauses": [{"id": "a", "rule": "pf_gt_baseline"},

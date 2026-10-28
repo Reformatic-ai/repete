@@ -223,6 +223,45 @@ def last_known_equity(records) -> float | None:
     return equity
 
 
+def last_known_rail_equity(records, cfg: dict | None = None
+                           ) -> tuple[float | None, str]:
+    """(rail equity, problem) as the newest `cycle_complete` recorded it.
+
+    Rail equity (owner decision 2026-10-28) is broker equity less the operator
+    cost charged so far: what the drawdown rail measures. Cycles since then
+    stamp it as `rail_equity` beside the broker `equity`; a null there means that
+    cycle could not read the fee log and failed its rails CLOSED, and is reported
+    as such. A record that predates the field falls back to its equity less the
+    cost in the fee log now, read STRICTLY — an unreadable log is a problem,
+    never a cost of 0. Shared by status() and watchdog, for last_known_equity's
+    reason: two copies would disagree about whether the rail is engaged."""
+    newest = None
+    for r in records or ():
+        if r.get("type") == "event" and r.get("event") == "cycle_complete":
+            newest = r
+    if newest is None:
+        return None, ""
+    try:
+        detail = json.loads(newest.get("detail") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return None, ""
+    if "rail_equity" in detail:
+        v = detail["rail_equity"]
+        if v is None:
+            return None, ("the last cycle could not read the operator fee "
+                          "ledger and failed its rails CLOSED")
+        return float(v), ""
+    equity = _cycle_equity(newest)
+    if equity is None:
+        return None, ""
+    try:
+        import operator_settings
+        whole, _ = operator_settings.rail_totals(statepaths.operator_dir(cfg))
+    except Exception as e:  # noqa: BLE001 — FeeLedgerError and anything else
+        return None, str(e)
+    return round(equity - whole, 4), ""
+
+
 def status(cfg: dict | None = None, now: datetime | None = None,
            read_only: bool = False) -> dict:
     """Everything an operator (or a status page) needs in one object.
@@ -373,8 +412,14 @@ def status(cfg: dict | None = None, now: datetime | None = None,
     # must not take down the rest of the health check.
     try:
         import risk
+        # Before AND after the operator cost (2026-10-28): drawdown_pct /
+        # engaged are the rail's after-cost view, drawdown_gross_pct the
+        # broker-equity one.
+        _rail_eq, _rail_problem = (last_known_rail_equity(records, cfg)
+                                   if last_equity is not None else (None, ""))
         out["drawdown"] = risk.drawdown_state(
-            last_equity, (cfg.get("risk") or {}).get("max_drawdown_pct", 0))
+            last_equity, (cfg.get("risk") or {}).get("max_drawdown_pct", 0),
+            rail_equity=_rail_eq, rail_problem=_rail_problem)
     except Exception as e:  # noqa: BLE001 — health must never crash
         out["problems"].append(f"drawdown state unreadable: {e}")
 
@@ -395,6 +440,18 @@ def status(cfg: dict | None = None, now: datetime | None = None,
             "fees_charged_total": operator_settings.total(op_dir),
             "problem": op.problem or None,
         }
+        # The rails' STRICT read of the same log (2026-10-28). total() above is
+        # the lenient display figure; if the strict read fails, every rail that
+        # reads after-cost equity is failing CLOSED, and that IS a problem.
+        try:
+            operator_settings.read_strict(op_dir)
+            out["operator_settings"]["fee_ledger_problem"] = None
+        except operator_settings.FeeLedgerError as e:
+            out["operator_settings"]["fee_ledger_problem"] = str(e)
+            out["problems"].append(
+                f"operator fee ledger unreadable ({e}) — rail equity is "
+                f"unknown, so the rails fail CLOSED: entries are blocked, "
+                f"exits still run")
     except Exception as e:  # noqa: BLE001 — health must never crash
         out["operator_settings"] = {"problem": f"operator settings check failed: {e}"}
 
@@ -489,8 +546,14 @@ def main() -> int:
         # Headroom, not just the drawdown: the number an operator wants is how
         # far the book is from the point of no return, and it is the one figure
         # here that nothing else surfaces.
+        # Both bases (2026-10-28): the rail measures after the operator cost;
+        # the gross figure is broker equity against the gross peak.
         dd_txt = (f" | dd={dd['drawdown_pct']:.2f}%"
-                  f" (headroom {dd['headroom_pp']:.2f}pp)"
+                  + (" after cost" if dd.get("basis") == "after_cost" else "")
+                  + (f" ({dd['drawdown_gross_pct']:.2f}% before cost)"
+                     if dd.get("basis") == "after_cost"
+                     and dd.get("drawdown_gross_pct") is not None else "")
+                  + f" (headroom {dd['headroom_pp']:.2f}pp)"
                   if dd.get("drawdown_pct") is not None
                   and dd.get("headroom_pp") is not None else "")
         # Who would actually be told, printed rather than assumed.

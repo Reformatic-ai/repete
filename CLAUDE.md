@@ -102,8 +102,25 @@ src/operator_settings.py Operator settings from the Reformatic console (2026-10-
                  memory/operator_fees.jsonl under the
                  console exporter's key (buy:<trade_id> where the fill is confirmed in
                  record_fill_quality or on adoption; close:<trade_id> in handle_close)
-                 — never touches an order, cash, equity, P&L, sizing or any rail, and
-                 is NOT a fill cost (not in the backtester). And a trade frequency:
+                 — never touches an order, cash, broker equity or sizing, and is NOT
+                 a fill cost. Amended 2026-10-28 (owner decision: "Yes: make gates,
+                 backtests and the drawdown/retire rails use after-cost results
+                 first (repete4's override included). Entry cost filters later, bot
+                 by bot."): it used to read "never touches ... P&L ... or any rail
+                 ... (not in the backtester)". Now the drawdown, daily-loss and
+                 live-kill rails read RAIL EQUITY = broker equity - the cost charged
+                 (main._rail_equity, once per cycle; strict reader
+                 operator_settings.read_strict — missing file = 0, torn/unreadable/
+                 wrong-currency = rails fail CLOSED: entries blocked + alert); the
+                 equity peak moved once to peak - cost charged (`basis: after_cost`
+                 in the peak file); the live kill and the decay monitor take each
+                 trade's own cost off its P&L (joined on `ref`; thresholds
+                 unchanged); and the backtester charges the same models from a
+                 block PINNED in the gate spec (`operator_costs:`, mandatory for new
+                 registrations, absent = off, so every frozen gate reproduces). The
+                 outcome RECORD's pnl and the cycle_complete `equity` stay gross
+                 (the console nets the cost itself; `rail_equity` sits beside it).
+                 And a trade frequency:
                  low/high adjust three entry knobs via apply_frequency; medium returns
                  config.yaml's values untouched. Missing/bad file = every market off,
                  medium; reported in health.py's `operator_settings`, never as a
@@ -258,6 +275,14 @@ config.yaml      All parameters. .env holds secrets (never commit).
    stays `1Day`.
 4. **Positions/equity always read fresh from the broker** (`broker.account()`,
    `broker.positions()`) — never inferred from memory, the ledger, or prior LLM output.
+   Amended 2026-10-28 (owner decision: "Yes: make gates, backtests and the
+   drawdown/retire rails use after-cost results first (repete4's override
+   included). Entry cost filters later, bot by bot."): the drawdown, daily-loss and
+   live-kill rails measure RAIL EQUITY = that fresh broker equity minus the
+   operator's simulated cost charged so far, read STRICTLY from
+   `memory/operator_fees.jsonl` (an unreadable or torn log fails the rails CLOSED,
+   never reads as 0). The broker read itself is unchanged and still fresh; sizing,
+   the caps and every recorded equity stay broker equity.
 5. **Outcome embargo.** Lessons/evidence are generated only from CLOSED trades;
    counterfactual resolutions wait out the full horizon (min_holding_days + extra).
    Memory samples must keep force-including losing trades, and lesson retrieval keeps

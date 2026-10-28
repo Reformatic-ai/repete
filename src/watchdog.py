@@ -292,8 +292,14 @@ def drawdown_latch(records=None) -> dict:
         with open("config.yaml") as f:
             cfg = yaml.safe_load(f) or {}
         limit = (cfg.get("risk") or {}).get("max_drawdown_pct", 0)
-        return risk.drawdown_state(
-            health.last_known_equity(_all_records(records)), limit)
+        recs = _all_records(records)
+        equity = health.last_known_equity(recs)
+        # After the operator cost (2026-10-28), as the rail measures it; an
+        # unreadable fee log reports ENGAGED, as the live rail fails closed.
+        rail_eq, problem = (health.last_known_rail_equity(recs, cfg)
+                            if equity is not None else (None, ""))
+        return risk.drawdown_state(equity, limit, rail_equity=rail_eq,
+                                   rail_problem=problem)
     except Exception as e:  # noqa: BLE001 — the watchdog itself never raises
         log.warning("drawdown latch state unreadable: %s", e)
         return {"engaged": False}

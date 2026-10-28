@@ -34,8 +34,8 @@ Reformatting is deliberately *not* tampering: the hash tracks meaning, so a
 freeze that cried wolf would be one people learned to bypass.
 
 **A divergence register.** `docs/divergences.md` lists every place the simulator
-and the live bot were found to differ — **25 as of 2026-08-28**, fifteen closed
-by a **named test** and ten open, because "fixed in code" has been
+and the live bot were found to differ — **26 as of 2026-10-28**, fifteen closed
+by a **named test** and eleven open, because "fixed in code" has been
 wrong here before. Three of them were found within four days by reading code for
 an adjacent task, which is the honest reason the file does not claim to be
 complete.
@@ -44,7 +44,7 @@ complete.
 to confirm the test protecting it goes red, then restored byte-exact. A guard
 nothing can falsify is not a guard.
 
-**2,970 tests as of 2026-10-27**, offline by design — no credentials, ever, in CI.
+**3,055 tests as of 2026-10-28**, offline by design — no credentials, ever, in CI.
 
 **Every count on this page is checked, not typed.** `tests/test_doc_counts.py`
 regenerates the test count, the divergence total and the open/closed split, and
@@ -156,6 +156,17 @@ the retirement exactly as it lifts the two freezes, because a wall gets climbed
 and a speed bump with an audit trail gets recorded; resuming should cost a
 pre-registration that argues why, written before its data is seen.
 
+**Gates, backtests and rails read after-cost results first (§80, 2026-10-28).**
+The owner's words: *"Yes: make gates, backtests and the drawdown/retire rails
+use after-cost results first (repete4's override included). Entry cost filters
+later, bot by bot."* The drawdown breaker, the daily-loss kill switch, the live
+kill and the decay monitor now measure the book after the operator's simulated
+cost per order (the console's cost model; US$0.005 a share, US$1 minimum, at
+the research values), read strictly — an unreadable fee log fails them closed.
+New gate specs must declare the cost block they charge (`operator_costs:`);
+every frozen spec, which declares none, still reproduces byte for byte.
+Re-scored after cost, §43's pass mark moves no clause in any period.
+
 **The shipped configuration fails its own gate.** §43 pointed
 `backtest.enablement_gate` — the function that rejected every candidate — at the
 strategies actually running, across four periods spanning 26 years, on the first
@@ -233,7 +244,7 @@ Setup is in [GUIDE.md](GUIDE.md). Briefly:
 ```bash
 python3.11 -m venv .venv && .venv/bin/python -m pip install -r requirements.lock
 cp .env.example .env                  # add your Alpaca PAPER keys
-.venv/bin/python -m pytest tests/ -q  # 2970, offline, no keys needed
+.venv/bin/python -m pytest tests/ -q  # 3055, offline, no keys needed
 .venv/bin/python -m src.deploycheck   # is the running code the reviewed code?
 .venv/bin/python src/main.py          # one cycle
 ```

@@ -162,7 +162,13 @@ def test_the_backtester_enforces_the_same_rail():
     import backtest as bt
 
     src = inspect.getsource(bt)
-    assert src.count("sim_peak = max(sim_peak, acct.equity(last_close))") == 2, (
+    # 2026-10-28 (owner decision): both paths track the peak on RAIL equity —
+    # `_rail_eq()`, the sim's equity less its operator-cost accumulator, which
+    # is acct.equity(last_close) itself whenever no cost is pinned. The
+    # property pinned here is unchanged: every bar, both paths, a real peak.
+    assert src.count("def _rail_eq() -> float:") == 2
+    assert src.count("return acct.equity(last_close) - op_paid") == 2
+    assert src.count("sim_peak = max(sim_peak, _rail_eq())") == 2, (
         "a simulator path does not track the equity peak — the drawdown rail "
         "would exist live and not in the backtest, which is divergence #9")
     # §41 changed the SHAPE of this call, not its meaning: the peak now goes
@@ -172,7 +178,7 @@ def test_the_backtester_enforces_the_same_rail():
     # actually tracked, rather than None or a constant.
     assert src.count("peak_equity=risk.decayed_peak(") == 2, (
         "a simulator path stopped passing its tracked peak to the rail")
-    assert src.count("sim_peak, acct.equity(last_close),") == 2, (
+    assert src.count("sim_peak, _rail_eq(),") == 2, (
         "decayed_peak is being handed something other than the tracked peak")
     assert src.count("risk.decay_clock(") == 2, (
         "a simulator path does not advance the §41 decay clock, so its "
@@ -185,5 +191,8 @@ def test_both_sides_use_the_same_drawdown_arithmetic():
     import inspect
 
     assert "def drawdown_pct" in inspect.getsource(risk)
-    assert "drawdown_pct(account[\"equity\"], peak_equity)" in inspect.getsource(
+    # On rail equity since 2026-10-28 (after the operator cost; broker equity
+    # when the account carries no cost) — still the one shared function.
+    assert "dd = drawdown_pct(r_eq, peak_equity)" in inspect.getsource(
         risk.pure_checks)
+    assert "r_eq = rail_equity(account)" in inspect.getsource(risk.pure_checks)

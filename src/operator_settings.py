@@ -26,15 +26,34 @@ those flat fields with `problem` set. The flat fields stay on OperatorSettings a
 the schema-1 view (health output); charging goes through the cost models only.
 
 THE COST IS SIMULATED. Paper brokers charge nothing, so the bot does not change any
-order, its cash, or the broker equity its risk rails use (invariant #4: equity is
-always read fresh from the broker). It appends one line per charged order to
+order, its cash, or the broker equity it sizes on (invariant #4: equity is always
+read fresh from the broker). It appends one line per charged order to
 `operator_fees.jsonl` next to the settings file; the console's exporter subtracts the
 running total from the equity it shows and puts each fee on the matching transaction
 (`ref` is that transaction's key in the exporter: "buy:<trade_id>" for a filled entry,
 "close:<trade_id>" for a close). Each line also says how the fee was worked out
 (`settings_schema`, `model`, `gross`, `venue_fee`, `basis`). It is not a fill cost:
-it never goes into the backtester, the slippage numbers, sizing, the rails or the
-outcome P&L.
+it never goes into the slippage numbers or sizing, and the outcome record's P&L stays
+the strategy's gross result (the console nets the fee itself).
+
+Amended 2026-10-28 (owner decision): "Yes: make gates, backtests and the
+drawdown/retire rails use after-cost results first (repete4's override included).
+Entry cost filters later, bot by bot." The paragraph above used to end "it never
+goes into the backtester, the slippage numbers, sizing, the rails or the outcome
+P&L". The rails now read RAIL EQUITY = broker equity - the cost charged so far
+(`read_strict` below; risk.rail_equity), the outcome-based rules (live kill, decay
+monitor) subtract each trade's own fees joined on `ref` (`fees_by_ref`), and the
+backtester charges the same cost models from a pinned block (`backtest.
+operator_costs`, off by default). Sizing and the recorded broker equity do not
+change.
+
+TWO READERS, on purpose. `total()` and `charged_refs()` are LENIENT: they skip a
+line they cannot read, which is right for display and for the once-per-ref guard.
+The rails must never do that — a skipped line is a cost treated as 0, which flatters
+every rail that reads it. `read_strict()` (and `rail_totals()` / `fees_by_ref()` on
+top of it) raises FeeLedgerError on an unreadable file, a torn line, or a line in
+another currency; the rails then fail CLOSED. A missing file is not an error: it
+means nothing has been charged yet.
 
 THE FREQUENCY changes a few entry knobs for the cycle (`apply_frequency`). "medium" is
 the bot exactly as configured in config.yaml — the config object comes back untouched.
@@ -47,6 +66,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -289,7 +309,8 @@ def charge(
 
 
 def total(state_dir: Path | str) -> float:
-    """Every cost charged so far."""
+    """Every cost charged so far. LENIENT, for display: a line it cannot read is
+    skipped. Never use it for a rail; the rails use read_strict()."""
     path = Path(state_dir) / FEES_FILE
     s = 0.0
     try:
@@ -302,3 +323,98 @@ def total(state_dir: Path | str) -> float:
     except FileNotFoundError:
         pass
     return round(s, 2)
+
+
+# ---------------------------------------------------------------- the rails' reader
+#
+# Owner decision 2026-10-28: the drawdown, daily-loss and live-kill rails and the
+# decay monitor read results AFTER this cost. They read the fee log through the
+# strict reader below and never through total(): a line total() skips is a cost the
+# rail would treat as 0, which is the one direction a rail must never be wrong in.
+
+
+class FeeLedgerError(ValueError):
+    """operator_fees.jsonl cannot be trusted for a rail: unreadable, a torn line, or
+    a line in another currency. The rail that reads it fails CLOSED."""
+
+
+def read_strict(state_dir: Path | str, currency: str = CURRENCY) -> list[dict]:
+    """Every fee line, checked. A missing file is [] (nothing charged yet).
+
+    Raises FeeLedgerError on an unreadable file, a line that is not a JSON object
+    with a string `ref`, a finite non-negative number `fee` and an ISO `ts`, or a
+    line whose `currency` is not this bot's account currency. Blank lines (a
+    trailing newline) are not lines. Never skips a line it cannot read."""
+    path = Path(state_dir) / FEES_FILE
+    try:
+        with open(path) as f:
+            raw_lines = f.readlines()
+    except FileNotFoundError:
+        return []
+    except OSError as e:
+        raise FeeLedgerError(f"{path} unreadable: {e}") from None
+    out = []
+    for n, line in enumerate(raw_lines, 1):
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+            if not isinstance(rec, dict):
+                raise ValueError("not an object")
+            ref, fee, ts = rec["ref"], rec["fee"], rec["ts"]
+            if not isinstance(ref, str) or not ref:
+                raise ValueError("ref is not a string")
+            if isinstance(fee, bool) or not isinstance(fee, (int, float)):
+                raise ValueError("fee is not a number")
+            if not math.isfinite(fee) or fee < 0:
+                raise ValueError(f"fee {fee} out of range")
+            datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        except (ValueError, KeyError, TypeError) as e:
+            raise FeeLedgerError(f"{path} line {n} is torn or invalid ({e})") from None
+        if rec.get("currency") != currency:
+            raise FeeLedgerError(
+                f"{path} line {n} is in {rec.get('currency')!r}, not this bot's "
+                f"{currency}: a rail cannot net it off {currency} equity")
+        out.append(rec)
+    return out
+
+
+def _ts(rec: dict) -> datetime:
+    t = datetime.fromisoformat(str(rec["ts"]).replace("Z", "+00:00"))
+    return t if t.tzinfo else t.replace(tzinfo=UTC)
+
+
+def rail_totals(state_dir: Path | str, day_start: datetime | None = None,
+                currency: str = CURRENCY) -> tuple[float, float]:
+    """(cost charged so far, cost charged BEFORE `day_start`), from ONE strict read.
+
+    The second figure is what the daily-loss rail takes off its day-start reference:
+    a fee whose `ts` (the fill time) is before the bot's day boundary was already in
+    the day-start equity's economics. With no `day_start` the two are equal.
+    Raises FeeLedgerError (see read_strict)."""
+    lines = read_strict(state_dir, currency)
+    whole = sum(float(r["fee"]) for r in lines)
+    if day_start is None:
+        before = whole
+    else:
+        before = sum(float(r["fee"]) for r in lines if _ts(r) < day_start)
+    return round(whole, 4), round(before, 4)
+
+
+def fees_by_ref(state_dir: Path | str, currency: str = CURRENCY) -> dict[str, float]:
+    """ref -> fee charged, for joining a trade to its own cost ("buy:<trade_id>",
+    "close:<trade_id>"). Strict: raises FeeLedgerError (see read_strict). A ref seen
+    twice is summed, never overwritten, so a duplicate can only make a rail more
+    conservative."""
+    out: dict[str, float] = {}
+    for r in read_strict(state_dir, currency):
+        out[r["ref"]] = round(out.get(r["ref"], 0.0) + float(r["fee"]), 4)
+    return out
+
+
+def trade_cost(fees: dict[str, float], trade_id: str | None) -> float:
+    """The operator cost one round trip paid: its entry fill plus its close."""
+    if not trade_id:
+        return 0.0
+    return round(fees.get(f"buy:{trade_id}", 0.0)
+                 + fees.get(f"close:{trade_id}", 0.0), 4)

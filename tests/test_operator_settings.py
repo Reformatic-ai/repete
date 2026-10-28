@@ -6,6 +6,14 @@ The promises pinned here:
   * the cost is charged ONCE per filled order, under the console exporter's
     transaction key ("buy:<trade_id>" / "close:<trade_id>"), and never for an
     entry that did not fill; it changes no order, P&L or rail.
+    Amended 2026-10-28 (owner decision): "Yes: make gates, backtests and the
+    drawdown/retire rails use after-cost results first (repete4's override
+    included). Entry cost filters later, bot by bot." It still changes no
+    order, sizing or broker equity, and the OUTCOME RECORD's P&L stays the
+    strategy's gross result (pinned below, deliberately). The RAILS now read
+    it: rail equity = broker equity - the cost charged, and the outcome-based
+    rules take each trade's own cost off its P&L by joining on `ref`. Those
+    are pinned in tests/test_after_cost_rails.py.
   * each charge site passes the order's real filled shares and fill price, so a
     schema-2 per_share model charges the reference amounts; a schema-1 file
     still charges exactly its flat fee.
@@ -426,9 +434,17 @@ def test_close_is_charged_once_under_close_key(env, opdir):
     main.handle_close(tid, rec, 110.0, ledger, memory, cfg)   # replay: no 2nd fee
     assert [(f["ref"], f["side"], f["symbol"]) for f in _fees(opdir)] == [
         (f"close:{tid}", "sell", "SPY")]
-    # The outcome P&L is the strategy's, untouched by the simulated cost.
+    # The outcome RECORD's P&L is the strategy's gross result, untouched by the
+    # simulated cost — still true after 2026-10-28, deliberately: the console
+    # nets the cost itself, so writing it in here would count it twice. What
+    # changed is how the outcome-based rules READ it: this trade's own cost,
+    # joined on its ref, comes off (risk.after_cost_trades).
     out = [r for r in ledger.all_records() if r["type"] == "outcome"][0]
     assert out["pnl"] == pytest.approx(100.0)
+    import risk
+    t = risk.after_cost_trades(ledger.closed_trades(), ops.fees_by_ref(opdir))[0]
+    assert t["pnl"] == pytest.approx(100.0 - 9.0)
+    assert t["pnl_gross"] == pytest.approx(100.0)
 
 
 def test_short_close_is_a_cover(env, opdir):
@@ -604,7 +620,9 @@ def test_health_reports_settings_without_degrading(cfg, opdir, capsys,
         "cost": "US$9.00 an order, flat", "fee_per_trade": 9.0,
         "fee_on_crypto": False, "fee_on_fx": False, "frequency": "high",
         "updated_at": "2026-10-24T14:00:00Z", "fees_charged_total": 9.0,
-        "problem": None}
+        "problem": None,
+        # 2026-10-28: the rails' STRICT read of the same log, None = clean.
+        "fee_ledger_problem": None}
 
     monkeypatch.setattr(health, "status", lambda: {
         **s, "operator_settings": {**s["operator_settings"],
@@ -854,10 +872,15 @@ def test_close_site_charges_the_exit_qty_and_exit_price(env, opdir, shares,
                                                pytest.approx(want))
     assert (f["basis"]["shares"], f["basis"]["notional"]) == (shares,
                                                               shares * price)
-    # The outcome P&L is the strategy's, untouched by the cost.
+    # The outcome RECORD's P&L is the strategy's gross result, untouched by
+    # the cost (still, after 2026-10-28 — see the close test above); the rules
+    # read it after cost through the ref join.
     out = [r for r in ledger.all_records() if r["type"] == "outcome"][0]
     sign = -1 if action == "short" else 1
     assert out["pnl"] == pytest.approx(sign * (price - 60.0) * shares)
+    import risk
+    t = risk.after_cost_trades(ledger.closed_trades(), ops.fees_by_ref(opdir))[0]
+    assert t["pnl"] == pytest.approx(sign * (price - 60.0) * shares - want)
 
 
 def test_schema2_buy_then_stop_out_charges_the_exporter_rows(cycle_env, opdir):

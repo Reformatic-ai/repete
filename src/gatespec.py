@@ -324,6 +324,38 @@ def validate(spec: dict) -> None:
               "it decides whether the run models the judge that cuts 58% of "
               "live buys, and a truthy string would silently read as `on`")
 
+    # `operator_costs` — the operator's simulated cost the run charges (owner
+    # decision 2026-10-28: "Yes: make gates, backtests and the drawdown/retire
+    # rails use after-cost results first (repete4's override included). Entry
+    # cost filters later, bot by bot.").
+    #
+    # Optional HERE and mandatory in register_gate.py, for judge_model's reason
+    # exactly: every spec frozen before the field must load and re-execute byte
+    # for byte, while no NEW claim is frozen without answering the question.
+    # Absent = predates the field = no operator cost. `false` = deliberately
+    # gross. Otherwise the cost-models block itself, every market and every
+    # value written out (cost_models.validate), so the run is reproducible
+    # from the spec alone and its hash moves if a single price does. A block
+    # that validation would CHANGE (a dropped key, a typo) is refused: what is
+    # hashed must be exactly what is charged.
+    if "operator_costs" in spec:
+        oc = spec["operator_costs"]
+        _need(oc is False or isinstance(oc, dict),
+              "operator_costs must be `false` (deliberately gross) or a full "
+              "cost-models block — `true` or a model name cannot be "
+              "reproduced, because it does not say what was charged")
+        if isinstance(oc, dict):
+            import cost_models
+            try:
+                normalised = cost_models.validate(oc)
+            except ValueError as e:
+                raise SpecError(f"operator_costs is not a valid cost-models "
+                                f"block: {e}") from None
+            _need(normalised == oc,
+                  "operator_costs carries keys cost_models.validate would drop "
+                  "or values it would change — write the block exactly as it "
+                  "is charged, so the hash pins what the run paid")
+
     _need(isinstance(spec["failure_modes"], list) and spec["failure_modes"],
           "`failure_modes` must name at least one way this result could fool "
           "you. A registration that cannot fail honestly is not one.")

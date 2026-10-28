@@ -82,11 +82,33 @@ def run(cfg: dict, *, strategy: str | None = None, min_trades: int,
         bars = fetch_bars(cfg, symbols, lookback)
 
     slippage = float(cfg.get("backtest", {}).get("slippage_bps", 0) or 0)
+    fees, costs = operator_costs(cfg)
     a = rb.check(records, bars, min_trades=min_trades, n_samples=samples,
-                 slippage_bps=slippage, strategy=strategy)
+                 slippage_bps=slippage, strategy=strategy, fees=fees,
+                 costs=costs)
     meta = {"symbols": symbols, "n_closed_trades": len(trades),
-            "slippage_bps": slippage, "strategy": strategy or "all"}
+            "slippage_bps": slippage, "strategy": strategy or "all",
+            "basis": "after_operator_cost",
+            "operator_cost_paid": round(sum(fees.values()), 2),
+            "cost_model": (costs or {}).get("equities", {}).get("model",
+                                                                "off")}
     return a, meta
+
+
+def operator_costs(cfg: dict) -> tuple[dict, dict]:
+    """(ref -> fee charged, the cost models in force) for the after-cost check.
+
+    Owner decision 2026-10-28: the decay monitor reads each trade's return LESS
+    its own operator cost, and charges the random null the same model. The fee
+    log is read STRICTLY: an unreadable file, a torn line or a line in another
+    currency raises operator_settings.FeeLedgerError, and main() turns that into
+    exit 2 — "could not run" — because a monitor that silently scored the trades
+    as if they had paid nothing would read as a pass it never earned."""
+    import operator_settings
+    import statepaths
+    op_dir = statepaths.operator_dir(cfg)
+    return (operator_settings.fees_by_ref(op_dir),
+            operator_settings.load(op_dir).costs)
 
 
 def main(argv=None) -> int:

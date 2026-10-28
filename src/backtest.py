@@ -35,6 +35,7 @@ import strategies
 from strategies.base import ENTRY_ACTIONS, EXIT_ACTIONS, side_of_qty
 import strategy
 import risk
+import cost_models
 import regime as regime_mod
 import earnings as earnings_mod
 import intraday
@@ -53,10 +54,17 @@ class SimTrade:
     exit_price: float = 0.0
     exit_reason: str = ""
     fees: float = 0.0
+    # Owner decision 2026-10-28: the operator's simulated cost on this round
+    # trip's two orders (cost_models, `backtest.operator_costs`). Kept apart
+    # from `fees` because it never touches the sim's cash — live sizes on
+    # broker equity, which never includes it — but it comes off the P&L, and
+    # so off profit factor and every significance comparison. 0.0 when off.
+    operator_cost: float = 0.0
 
     @property
     def pnl(self) -> float:
-        return (self.exit_price - self.entry_price) * self.qty - self.fees
+        return ((self.exit_price - self.entry_price) * self.qty - self.fees
+                - self.operator_cost)
 
 
 @dataclass
@@ -150,6 +158,16 @@ class Result:
     # result quoting returns without this number is quoting someone else's
     # strategy — divergence #16 is the standing warning.
     financing_paid_usd: float = 0.0
+    # Owner decision 2026-10-28: "Yes: make gates, backtests and the
+    # drawdown/retire rails use after-cost results first (repete4's override
+    # included). Entry cost filters later, bot by bot." The operator's
+    # simulated cost model this run charged (`backtest.operator_costs`, a
+    # cost_models block pinned in the gate spec) and the total it charged.
+    # None / 0.0 when off, and then summary() leaves BOTH out, so every
+    # cost-free result serialises byte-for-byte as it did before the field
+    # existed: absent means no operator cost.
+    operator_costs: dict | None = None
+    operator_cost_paid_usd: float = 0.0
     equity_curve: list = field(default_factory=list)
     trades: list = field(default_factory=list)
 
@@ -246,6 +264,13 @@ class Result:
         d = asdict(self)
         d.pop("equity_curve")
         d.pop("trades")
+        if self.operator_costs is None:
+            # Absent means no operator cost — and keeps every cost-free summary
+            # (trial rows, verdict arms) byte-identical to its pre-2026-10-28 shape.
+            d.pop("operator_costs")
+            d.pop("operator_cost_paid_usd")
+        else:
+            d["operator_costs_sha256"] = operator_costs_sha256(self.operator_costs)
         # asdict() serialises FIELDS only, never properties — without this line
         # every gate report silently omits the reachability number.
         d["n_symbols_traded"] = self.n_symbols_traded
@@ -279,6 +304,69 @@ def profit_factor(trades: list) -> float:
     return wins / losses
 
 
+# ------------------------------------------------- the operator's cost (2026-10-28)
+#
+# Owner decision 2026-10-28, quoted exactly: "Yes: make gates, backtests and the
+# drawdown/retire rails use after-cost results first (repete4's override
+# included). Entry cost filters later, bot by bot."
+#
+# Live charges every filled order the console's cost model (operator_settings.py,
+# cost_models.py) and the rails now read equity after it. The simulator charges
+# the SAME formula on every simulated fill, from a block PINNED in the run's
+# config — `backtest.operator_costs`, set by a gate spec's top-level
+# `operator_costs:` (run_gate.apply_operator_costs). It never reads the console's
+# operator_settings.json: a backtest whose cost moved when someone changed a
+# setting on a web page would not be reproducible.
+#
+# OFF BY DEFAULT. config.yaml carries no block and is not in any spec's hash, so
+# an absent block must mean no cost: every frozen spec, verdict and golden file
+# reproduces byte for byte.
+#
+# Where the sim also charges a venue fee (`fee_per_trade_usd`, 0.0 here), the
+# operator cost is the top-up `charge_amount(model, venue_fee)`, so the total per
+# order equals the model, exactly as live tops up a venue's own fee.
+#
+# Sizing is untouched: live sizes on broker equity, which never includes the
+# operator cost, so the sim keeps it OUT of cash in its own accumulator. It comes
+# off each trade's P&L (SimTrade.operator_cost), the equity curve (and so maxDD,
+# Sharpe and total return), the sim's own drawdown rail, and the benchmarks.
+
+OPERATOR_MARKET = "equities"
+
+
+def operator_costs_block(cfg: dict) -> dict | None:
+    """The run's pinned cost-models block, validated, or None (= no cost).
+
+    Raises ValueError on a block that is present and malformed: a typo'd cost
+    model must stop the run, never quietly charge nothing."""
+    raw = (cfg.get("backtest") or {}).get("operator_costs")
+    if raw is None or raw is False:
+        return None
+    block = cost_models.validate(raw)
+    return None if block[OPERATOR_MARKET]["model"] == "off" else block
+
+
+def operator_costs_sha256(block: dict | None) -> str | None:
+    """sha256 of the block as charged — what a verdict row is stamped with."""
+    if block is None:
+        return None
+    import hashlib
+    return hashlib.sha256(json.dumps(block, sort_keys=True, separators=(
+        ",", ":")).encode("utf-8")).hexdigest()
+
+
+def operator_charge(costs: dict | None, qty: float, price: float,
+                    venue_fee: float = 0.0) -> float:
+    """The operator cost of ONE simulated order: the equities model on its
+    shares and notional, less what the venue fee already charged."""
+    if costs is None:
+        return 0.0
+    shares = abs(float(qty))
+    gross, _ = cost_models.order_cost(costs, OPERATOR_MARKET, shares=shares,
+                                      notional=shares * float(price))
+    return cost_models.charge_amount(gross, venue_fee)
+
+
 def buy_and_hold_drawdown(sym_bars: dict) -> float:
     """Max drawdown of an equal-weighted buy-and-hold of the same universe."""
     all_ts = sorted({b["ts"] for bars in sym_bars.values() for b in bars})
@@ -301,9 +389,14 @@ def buy_and_hold_drawdown(sym_bars: dict) -> float:
 
 
 def buy_and_hold_return(bars: list, slippage_bps: float, fee: float,
-                        cash: float = 100_000.0) -> float:
+                        cash: float = 100_000.0,
+                        operator_costs: dict | None = None) -> float:
     """Buy at the second bar's open (same information timing as the strategy's
-    first possible fill), sell at the last close. Slippage + fees applied."""
+    first possible fill), sell at the last close. Slippage + fees applied.
+
+    `operator_costs` (2026-10-28): the benchmark's two orders pay the same
+    operator cost model the strategy's do, so the race stays like-for-like.
+    None (the default) is the pre-2026-10-28 arithmetic, unchanged."""
     if len(bars) < 2:
         return 0.0
     buy = bars[1]["open"] * (1 + slippage_bps / 1e4)
@@ -311,14 +404,19 @@ def buy_and_hold_return(bars: list, slippage_bps: float, fee: float,
     qty = int((cash - fee) // buy)
     if qty <= 0:
         return 0.0
-    return ((sell - buy) * qty - 2 * fee) / cash * 100
+    ret = ((sell - buy) * qty - 2 * fee) / cash * 100
+    if operator_costs is not None:
+        ret -= (operator_charge(operator_costs, qty, buy, fee)
+                + operator_charge(operator_costs, qty, sell, fee)) / cash * 100
+    return ret
 
 
 BENCHMARK_SYMBOL = "SPY"
 
 
 def benchmark_stats(sym_bars: dict, symbol: str, slippage_bps: float,
-                    fee: float, cash: float) -> tuple:
+                    fee: float, cash: float,
+                    operator_costs: dict | None = None) -> tuple:
     """(return_pct, max_drawdown_pct) for ONE instrument — the §50 benchmark.
 
     Why a single instrument. `buy_hold_return_pct` averages the whole snapshot
@@ -341,7 +439,8 @@ def benchmark_stats(sym_bars: dict, symbol: str, slippage_bps: float,
     bars = sym_bars.get(symbol)
     if not bars or len(bars) < 2:
         return None, None
-    return (round(buy_and_hold_return(bars, slippage_bps, fee, cash), 3),
+    return (round(buy_and_hold_return(bars, slippage_bps, fee, cash,
+                                      operator_costs), 3),
             round(buy_and_hold_drawdown({symbol: bars}), 3))
 
 
@@ -512,6 +611,10 @@ def simulate(sym_bars: dict, cfg: dict, params: dict | None = None,
     slip = bt.get("slippage_bps", 5)
     fee = bt.get("fee_per_trade_usd", 0.0)
     min_days = cfg["risk"].get("min_holding_days", 0)
+    # 2026-10-28: the operator's cost, pinned in cfg, None = off. Its own
+    # accumulator, never cash: sizing stays on the broker-equivalent basis.
+    op_costs = operator_costs_block(cfg)
+    op_paid = 0.0
 
     # Per-date vol bucket from SPY (only needed for the vol-conditioned stop;
     # empty => bracket_prices falls back to the base multiplier).
@@ -541,14 +644,30 @@ def simulate(sym_bars: dict, cfg: dict, params: dict | None = None,
     last_close: dict = {}
 
     def _exit(sym, price, ts, reason):
+        nonlocal op_paid
         pos = acct.positions.pop(sym)
         fill = price * (1 - slip / 1e4)
         acct.cash += pos["qty"] * fill - fee
         t = pos["trade"]
         t.exit_ts, t.exit_price, t.exit_reason = ts, fill, reason
         t.fees += fee
+        if op_costs is not None:
+            _op = operator_charge(op_costs, pos["qty"], fill, fee)
+            t.operator_cost += _op
+            op_paid += _op
         last_exit[sym] = ts
         closed.append(t)
+
+    def _rail_eq() -> float:
+        """Equity the sim's drawdown rail measures: after the operator cost,
+        as live's rail_equity is (risk.rail_equity). Identity when off."""
+        return acct.equity(last_close) - op_paid
+
+    def _rail_account() -> dict:
+        d = acct.account_dict(last_close)
+        if op_costs is not None:
+            d[risk.RAIL_EQUITY_KEY] = d["equity"] - op_paid
+        return d
 
     # §22: caller order is honoured here (a test pins it). §24 rotates that
     # order per DAY when enabled — same shared helper live uses.
@@ -571,8 +690,8 @@ def simulate(sym_bars: dict, cfg: dict, params: dict | None = None,
         # make every new high look like "equity >= peak" one bar early and
         # reset the clock a bar sooner than live does.
         sim_trough, sim_stable = risk.decay_clock(
-            sim_trough, sim_stable, acct.equity(last_close), sim_peak)
-        sim_peak = max(sim_peak, acct.equity(last_close))
+            sim_trough, sim_stable, _rail_eq(), sim_peak)
+        sim_peak = max(sim_peak, _rail_eq())
 
         # 1. Fill orders queued on the previous bar, at this bar's open.
         still_pending = []
@@ -618,13 +737,13 @@ def simulate(sym_bars: dict, cfg: dict, params: dict | None = None,
                     # (divergence #10) — it used to sit HERE, inside the buy
                     # branch, so a bar that only sold never updated the peak.
                     risk.pure_checks("buy", sym, qty, fill,
-                                     acct.account_dict(last_close),
+                                     _rail_account(),
                                      acct.positions_dict(last_close), cfg,
                                      regime_label=regime_labels.get(ts),
                                      strategy=strategy_name,
                                      strategy_open=len(acct.positions),
                                      peak_equity=risk.decayed_peak(
-                                         sim_peak, acct.equity(last_close),
+                                         sim_peak, _rail_eq(),
                                          sim_stable, cfg))
                     # The heat + correlation caps live in pre_trade_checks,
                     # which the sim cannot call (it does HALT/trade-count file
@@ -660,10 +779,13 @@ def simulate(sym_bars: dict, cfg: dict, params: dict | None = None,
                 except risk.RiskRejection:
                     continue
                 acct.cash -= qty * fill + fee
+                _op = operator_charge(op_costs, qty, fill, fee)
+                op_paid += _op
                 acct.positions[sym] = {
                     "qty": qty, "avg_entry": fill, "entry_ts": ts,
                     "stop": stop, "tp": tp, "hw": fill,
-                    "trade": SimTrade(sym, ts, fill, qty, fees=fee)}
+                    "trade": SimTrade(sym, ts, fill, qty, fees=fee,
+                                      operator_cost=_op)}
                 fills_by_date[date] = fills_by_date.get(date, 0) + 1
             elif sym in acct.positions:
                 _exit(sym, bar["open"], ts, "strategy_sell")
@@ -777,7 +899,8 @@ def simulate(sym_bars: dict, cfg: dict, params: dict | None = None,
                 pending.append((sym, "sell"))
 
         eq = acct.equity(last_close)
-        curve.append(round(eq, 2))
+        # After the operator cost (op_paid is 0.0 when off: the identity).
+        curve.append(round(eq - op_paid, 2))
         deployment.append((eq - acct.cash) / eq if eq > 0 else 0.0)
 
     # Liquidate leftovers at the final close so the metrics see every trade.
@@ -785,12 +908,13 @@ def simulate(sym_bars: dict, cfg: dict, params: dict | None = None,
     for sym in list(acct.positions):
         _exit(sym, last_close[sym], final_ts, "end_of_data")
 
-    total_ret = (acct.cash - start_cash) / start_cash * 100
+    total_ret = (acct.cash - op_paid - start_cash) / start_cash * 100
     wins = [t for t in closed if t.pnl > 0]
-    bh = (sum(buy_and_hold_return(b, slip, fee, start_cash / len(sym_bars))
+    bh = (sum(buy_and_hold_return(b, slip, fee, start_cash / len(sym_bars),
+                                  op_costs)
               for b in sym_bars.values()) / len(sym_bars)) if sym_bars else 0.0
     bm_ret, bm_dd = benchmark_stats(sym_bars, BENCHMARK_SYMBOL, slip, fee,
-                                    start_cash)
+                                    start_cash, op_costs)
 
     return Result(
         params={**params, "strategy": strategy_name},
@@ -807,6 +931,8 @@ def simulate(sym_bars: dict, cfg: dict, params: dict | None = None,
         win_rate=round(len(wins) / len(closed), 3) if closed else 0.0,
         profit_factor=round(profit_factor(closed), 3),
         max_drawdown_pct=round(max_drawdown(curve), 3),
+        operator_costs=op_costs,
+        operator_cost_paid_usd=round(op_paid, 2),
         equity_curve=curve, trades=closed)
 
 
@@ -888,6 +1014,11 @@ def simulate_ensemble(sym_bars: dict, cfg: dict, start_cash: float = 100_000.0,
     slip = bt.get("slippage_bps", 5)
     fee = bt.get("fee_per_trade_usd", 0.0)
     min_days = cfg["risk"].get("min_holding_days", 0)
+    # 2026-10-28: the operator's cost, pinned in cfg (a gate spec's
+    # `operator_costs:`), None = off. Its own accumulator, never cash, so
+    # sizing stays on the broker-equivalent basis live sizes on.
+    op_costs = operator_costs_block(cfg)
+    op_paid = 0.0
 
     rcfg = cfg.get("learning", {}).get("regime", _RCFG_DEFAULT)
     vol_series = (vol_bucket_series(sym_bars.get("SPY", []), rcfg)
@@ -974,7 +1105,19 @@ def simulate_ensemble(sym_bars: dict, cfg: dict, start_cash: float = 100_000.0,
             return bar["open"]
         return px
 
+    def _rail_eq() -> float:
+        """Equity the sim's drawdown rail measures: after the operator cost,
+        as live's rail_equity is (risk.rail_equity). Identity when off."""
+        return acct.equity(last_close) - op_paid
+
+    def _rail_account() -> dict:
+        d = acct.account_dict(last_close)
+        if op_costs is not None:
+            d[risk.RAIL_EQUITY_KEY] = d["equity"] - op_paid
+        return d
+
     def _exit(sym, price, ts, reason):
+        nonlocal op_paid
         pos = acct.positions.pop(sym)
         # SLIPPAGE FOLLOWS THE ORDER, NOT THE LIFECYCLE. Closing a LONG sells,
         # and a seller is hurt by a LOWER fill. Closing a SHORT buys, and a
@@ -990,6 +1133,12 @@ def simulate_ensemble(sym_bars: dict, cfg: dict, start_cash: float = 100_000.0,
         t = pos["trade"]
         t.exit_ts, t.exit_price, t.exit_reason = ts, fill, reason
         t.fees += fee
+        if op_costs is not None:
+            # The closing order — a sell or a cover — pays the model on its own
+            # shares and fill, as live's close:<trade_id> line does.
+            _op = operator_charge(op_costs, pos["qty"], fill, fee)
+            t.operator_cost += _op
+            op_paid += _op
         owner = pos["owner"]
         last_exit[(owner, sym)] = ts
         stats = by_strategy.setdefault(owner, {"trades": 0, "pnl": 0.0,
@@ -1014,7 +1163,7 @@ def simulate_ensemble(sym_bars: dict, cfg: dict, start_cash: float = 100_000.0,
         # risk.drawdown_decay disabled, decayed_peak() below is the identity
         # and every §1-§40 result reproduces byte-identically.
         sim_trough, sim_stable = risk.decay_clock(
-            sim_trough, sim_stable, acct.equity(last_close), sim_peak)
+            sim_trough, sim_stable, _rail_eq(), sim_peak)
 
         # §41 / DIVERGENCE #10. This ratchet used to live inside the buy branch
         # below, so the peak advanced only on bars where an entry was attempted.
@@ -1028,7 +1177,10 @@ def simulate_ensemble(sym_bars: dict, cfg: dict, start_cash: float = 100_000.0,
         # Fixed by making both correct rather than by making one match the
         # other's artifact: a high-water mark sampled only when the book happens
         # to transact is not a high-water mark. Every bar, unconditionally.
-        sim_peak = max(sim_peak, acct.equity(last_close))
+        #
+        # On RAIL equity since 2026-10-28 (after the operator cost; the
+        # identity when it is off), the basis live's peak is kept on.
+        sim_peak = max(sim_peak, _rail_eq())
 
         # 1. Fill orders queued on the previous bar, at this bar's open.
         still_pending = []
@@ -1095,13 +1247,13 @@ def simulate_ensemble(sym_bars: dict, cfg: dict, start_cash: float = 100_000.0,
                     # send the whole rail set the wrong direction while every
                     # one of them reported that it had run.
                     risk.pure_checks(action, sym, qty, fill,
-                                     acct.account_dict(last_close),
+                                     _rail_account(),
                                      acct.positions_dict(last_close), cfg,
                                      regime_label=regime_labels.get(ts),
                                      strategy=owner,
                                      strategy_open=strategy_open,
                                      peak_equity=risk.decayed_peak(
-                                         sim_peak, acct.equity(last_close),
+                                         sim_peak, _rail_eq(),
                                          sim_stable, cfg))
                     # "action" is what makes risk.portfolio_heat select a
                     # short's (stop − entry) instead of a long's (entry − stop).
@@ -1169,11 +1321,17 @@ def simulate_ensemble(sym_bars: dict, cfg: dict, start_cash: float = 100_000.0,
                 # Opening a short SELLS: cash goes UP by the proceeds. One
                 # expression for both, because the sign already says which.
                 acct.cash -= signed_qty * fill + fee
+                # The opening order — a buy OR a short — pays the operator's
+                # model (2026-10-28). Live charges only `buy` entries today;
+                # that gap is the live side's, recorded in the PR follow-ups.
+                _op = operator_charge(op_costs, signed_qty, fill, fee)
+                op_paid += _op
                 acct.positions[sym] = {
                     "qty": signed_qty, "avg_entry": fill, "entry_ts": ts,
                     "stop": stop, "tp": tp, "hw": fill, "owner": owner,
                     "action": action,
-                    "trade": SimTrade(sym, ts, fill, signed_qty, fees=fee)}
+                    "trade": SimTrade(sym, ts, fill, signed_qty, fees=fee,
+                                      operator_cost=_op)}
                 fills_by_date[date] = fills_by_date.get(date, 0) + 1
             elif sym in acct.positions:
                 _exit(sym, _fill_open(sym, bar, ts), ts, "strategy_sell")
@@ -1405,7 +1563,11 @@ def simulate_ensemble(sym_bars: dict, cfg: dict, start_cash: float = 100_000.0,
             acct.cash -= _charge
             financing_paid += _charge
         eq = acct.equity(last_close)
-        curve.append(round(eq, 2))
+        # After the operator cost (op_paid is 0.0 when off: the identity), so
+        # maxDD, Sharpe and the return all read after cost. Deployment and
+        # exposure below stay on the broker basis: they measure the book, not
+        # its P&L.
+        curve.append(round(eq - op_paid, 2))
         # `avg_deployment_pct` KEEPS ITS MEANING. `(equity - cash) / equity` is
         # NET exposure, and every recorded verdict plus the `deployment_at_least`
         # and `beats_exposure_matched` rules read it. Redefining it would
@@ -1502,12 +1664,13 @@ def simulate_ensemble(sym_bars: dict, cfg: dict, start_cash: float = 100_000.0,
     _dep = sorted(deployment)
     _n = len(_dep)
 
-    total_ret = (acct.cash - start_cash) / start_cash * 100
+    total_ret = (acct.cash - op_paid - start_cash) / start_cash * 100
     wins = [t for t in closed if t.pnl > 0]
-    bh = (sum(buy_and_hold_return(b, slip, fee, start_cash / len(sym_bars))
+    bh = (sum(buy_and_hold_return(b, slip, fee, start_cash / len(sym_bars),
+                                  op_costs)
               for b in sym_bars.values()) / len(sym_bars)) if sym_bars else 0.0
     _bm_ret, _bm_dd = benchmark_stats(sym_bars, BENCHMARK_SYMBOL, slip, fee,
-                                      start_cash)
+                                      start_cash, op_costs)
 
     return Result(
         params={"strategy": "ENSEMBLE",
@@ -1534,6 +1697,8 @@ def simulate_ensemble(sym_bars: dict, cfg: dict, start_cash: float = 100_000.0,
         n_short_symbols=len({t.symbol for t in closed if t.qty < 0}),
         n_fill_fallback=n_fill_fallback,
         financing_paid_usd=round(financing_paid, 2),
+        operator_costs=op_costs,
+        operator_cost_paid_usd=round(op_paid, 2),
         total_return_pct=round(total_ret, 3),
         buy_hold_return_pct=round(bh, 3),
         buy_hold_max_drawdown_pct=round(buy_and_hold_drawdown(sym_bars), 3),

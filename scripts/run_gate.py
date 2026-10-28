@@ -120,6 +120,35 @@ def apply_judge(cfg: dict, on: bool) -> dict:
     return cfg
 
 
+def operator_costs_setting(spec: dict):
+    """The spec's `operator_costs`: a cost-models block, False, or None.
+
+    None = the spec predates the field (2026-10-28) and runs with no operator
+    cost, which is how it was frozen and the only way it reproduces. False =
+    deliberately gross. A block = charged on every simulated fill. Same three
+    states as judge_setting, for the same reason: "chose not to" and "did not
+    know to" are different findings."""
+    return spec.get("operator_costs")
+
+
+def apply_operator_costs(cfg: dict, setting) -> dict:
+    """Pin the run's operator cost from the SPEC, overriding config.yaml.
+
+    config.yaml is not in the spec hash, so an `operator_costs` block there
+    must never reach a frozen spec: anything but a declared block REMOVES the
+    key. Owner decision 2026-10-28 — "Yes: make gates, backtests and the
+    drawdown/retire rails use after-cost results first (repete4's override
+    included). Entry cost filters later, bot by bot." — is honoured by NEW
+    specs declaring a block (register_gate.py refuses one that declares
+    nothing), never by quietly re-scoring an old one."""
+    bt_cfg = cfg.setdefault("backtest", {})
+    if isinstance(setting, dict):
+        bt_cfg["operator_costs"] = setting
+    else:
+        bt_cfg.pop("operator_costs", None)
+    return cfg
+
+
 def run_arm(args) -> tuple:
     """(name, summary, trade pnls, seconds, judge stats, trade keys).
 
@@ -493,11 +522,22 @@ def main() -> int:
     reg = check_frozen(spec, args.registrations)
 
     judge = judge_setting(spec)
+    op_setting = operator_costs_setting(spec)
+    op_block = bt.operator_costs_block({"backtest": {
+        "operator_costs": op_setting if isinstance(op_setting, dict) else None}})
     print(f"{spec['id']} — {spec['title']}")
     print(f"claim {spec['claim']} | K={spec.get('bonferroni_k', 1)} | "
           f"frozen {reg['registered_at'][:19]} | "
           f"sha {reg['spec_sha256'][:16]}… | "
-          f"judge {'ON' if judge else 'OFF' if judge is False else 'UNDECLARED'}\n")
+          f"judge {'ON' if judge else 'OFF' if judge is False else 'UNDECLARED'}")
+    print("operator cost "
+          + (f"ON — {bt.cost_models.describe(op_block, bt.OPERATOR_MARKET)} "
+             f"(block sha {bt.operator_costs_sha256(op_block)[:16]}…)"
+             if op_block is not None
+             else "OFF (declared gross)" if op_setting is False
+             or isinstance(op_setting, dict)
+             else "UNDECLARED (predates 2026-10-28: gross, as frozen)")
+          + "\n")
     if judge is None:
         print("=" * 72)
         print("THIS SPEC PREDATES THE `judge_model` FIELD (W2-1, 2026-07-29).")
@@ -513,7 +553,8 @@ def main() -> int:
         print("\n--dry-run: freeze and data verified, nothing scored.")
         return 0
 
-    base_cfg = apply_judge(bt.load_config(), bool(judge))
+    base_cfg = apply_operator_costs(
+        apply_judge(bt.load_config(), bool(judge)), op_setting)
     if judge:
         # Fail here, not 300 seconds into the run. A missing or too-small
         # calibration raises CalibrationError by design rather than silently
@@ -582,6 +623,11 @@ def main() -> int:
             "bonferroni_k": spec.get("bonferroni_k", 1),
             "judge_model": bool(judge),
             "snapshot_sha256": spec["snapshot"]["sha256"],
+            # 2026-10-28. Absent for a spec that predates the field, so its
+            # trial rows keep their old shape; the arm summary below carries
+            # the total paid whenever a cost was charged.
+            **({"operator_costs_sha256": bt.operator_costs_sha256(op_block)}
+               if "operator_costs" in spec else {}),
             "workers": args.workers,
             **rec[SUMMARY],
         })
@@ -699,6 +745,15 @@ def main() -> int:
         # predates the field — §35-§41 — and is NOT the same as `false`.
         "judge_model": judge,
         "judge_stats": judged if judge else None,
+        # Owner decision 2026-10-28: which operator cost the run charged — the
+        # block itself (null = the spec predates the field, false = declared
+        # gross) and its hash — and, per arm, what it paid
+        # (arms.<name>.operator_cost_paid_usd).
+        "operator_costs": op_setting,
+        "operator_costs_sha256": bt.operator_costs_sha256(op_block),
+        "operator_cost_paid_usd": {
+            name: rec[SUMMARY].get("operator_cost_paid_usd", 0.0)
+            for name, rec in arms.items()},
         "arms": {name: rec[SUMMARY] for name, rec in arms.items()},
     }
     os.makedirs(os.path.dirname(args.verdicts) or ".", exist_ok=True)

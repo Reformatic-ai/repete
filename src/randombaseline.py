@@ -46,6 +46,19 @@ cost attention, but it must not be mistaken for a conservative test of edge.
 
 No network, no I/O, deterministic seed — callers pass bars in. Same shape as
 `scorecard.py` and `significance.py`.
+
+AFTER THE OPERATOR COST (owner decision 2026-10-28)
+---------------------------------------------------
+"Yes: make gates, backtests and the drawdown/retire rails use after-cost results
+first." The realised side reads each trade's return LESS its own operator cost
+(`fees`, joined on the fee line's ref: "buy:<trade_id>" + "close:<trade_id>",
+over the trade's entry notional). The null side is charged the SAME cost model
+(`costs`, a cost_models block) on both of its legs, on a notional resampled from
+the realised trades, so the two sides pay alike — charging only the realised
+side would make random timing look better by exactly the cost. The thresholds
+above are unchanged. With no fees and the model off (or `costs` None) both
+sides read and draw exactly as before: the notional is drawn only when a cost
+is on, so the seeded stream does not move.
 """
 from dataclasses import dataclass
 import random
@@ -114,8 +127,28 @@ def holding_bars(bars: list[dict], entry_ts: str, exit_ts: str) -> int | None:
     return j - i
 
 
+def _cost_on(costs: dict | None) -> bool:
+    return bool(costs) and (costs.get("equities") or {}).get("model",
+                                                             "off") != "off"
+
+
+def _leg_cost_pct(costs: dict, notional: float, entry: float,
+                  exit_: float) -> float:
+    """Both legs' operator cost as % of the entry notional. Shares are the
+    notional at the entry fill; each leg is one order under the equities model
+    (per-share with its minimum and its 1% cap), as live charges it."""
+    import cost_models
+    shares = notional / entry
+    cin, _ = cost_models.order_cost(costs, "equities", shares=shares,
+                                    notional=shares * entry)
+    cout, _ = cost_models.order_cost(costs, "equities", shares=shares,
+                                     notional=shares * exit_)
+    return (cin + cout) / notional * 100.0
+
+
 def random_entry_pct(bars: list[dict], holding: int, rng: random.Random,
-                     slippage_bps: float = 0.0) -> float | None:
+                     slippage_bps: float = 0.0, costs: dict | None = None,
+                     notional: float | None = None) -> float | None:
     """One random entry: decide on bar i, fill at the OPEN of bar i+1, exit at
     the CLOSE of bar i+holding. Slippage is charged against you on both legs.
 
@@ -132,14 +165,19 @@ def random_entry_pct(bars: list[dict], holding: int, rng: random.Random,
     exit_ = float(bars[i + holding]["close"]) * (1 - slippage_bps / 1e4)
     if entry <= 0:
         return None
-    return (exit_ - entry) / entry * 100.0
+    pct = (exit_ - entry) / entry * 100.0
+    if _cost_on(costs) and notional and notional > 0:
+        pct -= _leg_cost_pct(costs, notional, entry, exit_)
+    return pct
 
 
 def null_distribution(bars_by_symbol: dict, symbols: list[str],
                       holdings: list[int], n_trades: int,
                       n_samples: int = DEFAULT_SAMPLES,
                       seed: int = DEFAULT_SEED,
-                      slippage_bps: float = 0.0) -> list[float]:
+                      slippage_bps: float = 0.0,
+                      costs: dict | None = None,
+                      notionals: list[float] | None = None) -> list[float]:
     """Distribution of MEAN return per trade under random entry timing.
 
     Each sample builds a whole synthetic track record of `n_trades` trades —
@@ -151,6 +189,7 @@ def null_distribution(bars_by_symbol: dict, symbols: list[str],
     usable = [s for s in symbols if len(bars_by_symbol.get(s) or []) > 2]
     if not usable or not holdings or n_trades < 1:
         return []
+    charge = _cost_on(costs) and bool(notionals)
     rng = random.Random(seed)
     out = []
     for _ in range(n_samples):
@@ -159,7 +198,13 @@ def null_distribution(bars_by_symbol: dict, symbols: list[str],
             for _attempt in range(8):     # a few retries when a draw doesn't fit
                 sym = usable[rng.randrange(len(usable))]
                 hold = holdings[rng.randrange(len(holdings))]
-                p = random_entry_pct(bars_by_symbol[sym], hold, rng, slippage_bps)
+                # Drawn ONLY when a cost is charged, so a cost-free run keeps
+                # the exact seeded stream it always had.
+                size = (notionals[rng.randrange(len(notionals))]
+                        if charge else None)
+                p = random_entry_pct(bars_by_symbol[sym], hold, rng,
+                                     slippage_bps, costs=costs if charge
+                                     else None, notional=size)
                 if p is not None:
                     pcts.append(p)
                     break
@@ -226,7 +271,34 @@ def closed_trades(records: list[dict]) -> list[dict]:
             continue
         out.append({"symbol": d["symbol"], "entry_ts": entry_ts,
                     "exit_ts": exit_ts, "pnl_pct": float(r["pnl_pct"]),
-                    "strategy": d.get("strategy")})
+                    "strategy": d.get("strategy"),
+                    # 2026-10-28: what joins a trade to its own operator cost.
+                    "trade_id": r.get("trade_id"),
+                    "notional": abs(float(d.get("entry_price") or 0)
+                                    * float(d.get("qty") or 0))})
+    return out
+
+
+def after_cost(trades: list[dict], fees: dict | None) -> list[dict]:
+    """Each trade's pnl_pct LESS its own operator cost (buy + close fee over its
+    entry notional). Empty/None `fees` is the identity. A trade with a cost but
+    no notional cannot be converted to a percentage and raises, rather than
+    being scored as if it had paid nothing."""
+    if not fees:
+        return trades
+    out = []
+    for t in trades:
+        tid = t.get("trade_id")
+        cost = (fees.get(f"buy:{tid}", 0.0) + fees.get(f"close:{tid}", 0.0)
+                if tid else 0.0)
+        if not cost:
+            out.append(t)
+            continue
+        if not t.get("notional"):
+            raise ValueError(f"trade {tid} paid ${cost:.2f} of operator cost "
+                             f"but has no entry notional to express it on")
+        out.append({**t, "pnl_pct": t["pnl_pct"] - cost / t["notional"] * 100.0,
+                    "operator_cost": cost})
     return out
 
 
@@ -235,9 +307,15 @@ def check(records: list[dict], bars_by_symbol: dict, *,
           n_samples: int = DEFAULT_SAMPLES,
           seed: int = DEFAULT_SEED,
           slippage_bps: float = 0.0,
-          strategy: str | None = None) -> Assessment:
-    """End-to-end decay check over a ledger slice. The one call sites use."""
-    trades = closed_trades(records)
+          strategy: str | None = None,
+          fees: dict | None = None,
+          costs: dict | None = None) -> Assessment:
+    """End-to-end decay check over a ledger slice. The one call sites use.
+
+    `fees` (ref -> fee, operator_settings.fees_by_ref) and `costs` (the cost
+    model in force) put both sides on the after-cost basis — see the module
+    docstring. Omitted, the check is exactly the pre-2026-10-28 one."""
+    trades = after_cost(closed_trades(records), fees)
     if strategy:
         trades = [t for t in trades if t.get("strategy") == strategy]
     if len(trades) < min_trades:
@@ -254,6 +332,8 @@ def check(records: list[dict], bars_by_symbol: dict, *,
     symbols = sorted({t["symbol"] for t in trades})
     null = null_distribution(bars_by_symbol, symbols, holdings, len(trades),
                              n_samples=n_samples, seed=seed,
-                             slippage_bps=slippage_bps)
+                             slippage_bps=slippage_bps, costs=costs,
+                             notionals=[t["notional"] for t in trades
+                                        if t.get("notional")])
     return assess([t["pnl_pct"] for t in trades], null,
                   min_trades=min_trades, seed=seed)
