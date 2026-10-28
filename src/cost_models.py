@@ -188,10 +188,11 @@ def from_settings(raw: dict) -> tuple[dict, str]:
     return from_v1(fee, raw.get("fee_on_crypto") is True, raw.get("fee_on_fx") is True), problem
 
 
-def _need(model: str, **given) -> None:
-    missing = [k for k, v in given.items() if v is None]
-    if missing:
-        raise ValueError(f"{model} needs {', '.join(missing)}")
+def _need(model: str, name: str, value: float | None) -> float:
+    """`value` as a float, or ValueError when the model needs it and it was not given."""
+    if value is None:
+        raise ValueError(f"{model} needs {name}")
+    return float(value)
 
 
 def order_cost(
@@ -227,8 +228,7 @@ def order_cost(
     if model == "flat":
         return round(c["flat_per_order"], 4), basis
     if model == "per_share":
-        _need(model, shares=shares)
-        n = abs(float(shares))
+        n = abs(_need(model, "shares", shares))
         fee = max(n * c["per_share"], c["min_per_order"])
         basis["shares"] = n
         if c["max_pct_of_value"] > 0 and notional is not None:
@@ -238,14 +238,12 @@ def order_cost(
                 fee, basis["capped"] = cap, True
         return round(fee, 4), basis
     if model == "per_contract":
-        _need(model, contracts=contracts)
-        n = abs(float(contracts))
+        n = abs(_need(model, "contracts", contracts))
         fee = max(n * c["per_contract"], c["min_per_order"]) + n * c["fees_per_contract"]
         basis["contracts"] = n
         return round(fee, 4), basis
     if model == "per_10k_units":
-        _need(model, units=units)
-        u = abs(float(units))
+        u = abs(_need(model, "units", units))
         fee = u / 10_000 * c["per_10k_units"]
         basis["units"] = u
         if c["spread_pips"] > 0:
@@ -257,8 +255,7 @@ def order_cost(
                 basis["spread"] = round(spread, 4)
         return round(fee, 4), basis
     if model == "percent":
-        _need(model, notional=notional)
-        v = abs(float(notional))
+        v = abs(_need(model, "notional", notional))
         basis["notional"] = round(v, 4)
         return round(c["pct_of_value"] / 100 * v, 4), basis
     raise ValueError(f"unknown model {model!r}")
