@@ -84,7 +84,12 @@ RECOMMENDED = {
         "fees_per_contract": 0.025,
         "min_per_order": 1.0,
     },
-    "fx": {"model": "per_10k_units", "flat_per_order": 1.0, "per_10k_units": 1.0, "spread_pips": 0.2},
+    "fx": {
+        "model": "per_10k_units",
+        "flat_per_order": 1.0,
+        "per_10k_units": 1.0,
+        "spread_pips": 0.2,
+    },
     "crypto": {"model": "percent", "flat_per_order": 1.0, "pct_of_value": 0.8},
 }
 
@@ -278,7 +283,8 @@ def describe(costs: dict, market: str) -> str:
     if model == "flat":
         return f"{_money(u, c['flat_per_order'])} an order, flat"
     if model == "per_share":
-        s = f"{_money(u, c['per_share'])} a share, at least {_money(u, c['min_per_order'])} an order"
+        s = f"{_money(u, c['per_share'])} a share, at least {_money(u, c['min_per_order'])}"
+        s += " an order"
         if c["max_pct_of_value"] > 0:
             s += f", at most {c['max_pct_of_value']:g}% of its value"
         return s
