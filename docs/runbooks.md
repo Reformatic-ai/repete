@@ -191,7 +191,11 @@ python src/health.py --json | python -c "import json,sys; print(json.load(sys.st
 `engaged: true` with a real `drawdown_pct` is a genuine drawdown. `engaged:
 true` with `drawdown_pct: null` and an "unreadable" note is a corrupt
 high-water file instead — that one self-heals on the next cycle's write, so
-wait one cycle before touching anything.
+wait one cycle before touching anything. `engaged: true` with
+`drawdown_pct: null` and a note that the **operator fee ledger** is unreadable
+(or that the last cycle could not read it) is not a drawdown either: it is
+[`rail_equity_unknown`](#rail_equity_unknown-operator-fee-log-unreadable-entries-blocked),
+below. Do not reset the peak for it.
 
 **Fix — only after you have decided the drawdown is acceptable to resume from:**
 ```bash
@@ -205,6 +209,169 @@ engaged; the book still exits normally while blocked.
 
 **Verify:** `python src/health.py` shows headroom restored, and the next cycle
 logs a new peak.
+
+---
+
+## rail_equity_unknown (operator fee log unreadable; entries blocked)
+
+**Symptoms:** alert titled "Repete: operator fee ledger unreadable"; a
+`rail_equity_unknown` event in the ledger; that cycle's entries written as
+refused decisions with `rail: "rail_equity_unknown"`; `cycle_complete` carries
+`"rail_equity": null`; a swing-scan pass writes `swing_scan_entries_blocked`
+with the same reason. `python src/health.py` prints `DEGRADED` (and the
+container goes `unhealthy` in `docker compose ps`) with two problems: "operator
+fee ledger unreadable (…) — rail equity is unknown, so the rails fail CLOSED"
+and "drawdown circuit breaker ENGAGED — operator fee ledger unreadable …".
+**Exits still run**: strategy exits, bracket legs and reconcile all work, and
+each close is still charged its fee. The weekly decay check exits 2 ("could
+not run") while it lasts.
+
+**Read this first: do NOT follow the `rm memory/.equity_highwater.json` hint**
+that health prints after the ENGAGED line. That hint belongs to a real
+drawdown. This one is not a drawdown and clears itself once the fee log reads;
+removing the peak would forgive a drawdown nobody reviewed.
+
+**Why it fails closed:** since 2026-10-28 (owner decision, §80) the drawdown,
+daily-loss and live-kill rails read **rail equity** = broker equity minus every
+operator cost in `memory/operator_fees.jsonl`. They read it with a STRICT
+reader (`operator_settings.read_strict`), because a skipped line is a cost read
+as $0, and $0 flatters every rail. A missing file is fine (nothing charged
+yet). The error text names the first line it could not use:
+
+| the problem says | likely cause |
+|---|---|
+| `line N is torn or invalid (…)`, N the last line | a crash or kill mid-write: the process died part-way through one append (`operator_settings.charge` writes one line per filled order) |
+| the same, N an earlier line | a hand-edit, or a torn line that a later append was glued onto (below) |
+| `line N is in 'CAD', not this bot's USD` | a line repete did not write (it only writes USD): a copied file, a misdirected writer, a hand-edit |
+| `… unreadable: [Errno 13] Permission denied`, or another OS error | ownership or permissions, a directory where the file should be, a disk error |
+
+**The glued line.** `charge()` appends `line + "\n"`. If a torn tail has no
+newline, the next fee written (a close's fee — exits keep running) lands on
+the same line: `{…torn fragment{…a whole record…}`. That record is a real cost
+that neither the rails nor the console can read. Look for it before you
+repair.
+
+**Diagnose (read-only).** On the Bizon the bot runs in docker, and `./memory`
+in the checkout is `/app/memory` in the container (`docker-compose.yml`), so
+these run on the host from the checkout root and read the same file the bot
+reads:
+```bash
+cd ~/bots/repete
+grep '"event": "rail_equity_unknown"' memory/ledger.jsonl | tail -3
+docker compose exec agent python src/health.py   # the container's own view
+ls -l memory/operator_fees.jsonl                  # owner, mode, size
+tail -c 1 memory/operator_fees.jsonl | od -c      # a whole file ends in \n
+tail -n 3 memory/operator_fees.jsonl
+# Every line's status, numbered as the error numbers them:
+.venv/bin/python - <<'EOF'
+import json
+for n, line in enumerate(open("memory/operator_fees.jsonl"), 1):
+    if not line.strip():
+        continue
+    try:
+        rec = json.loads(line)
+        cur = rec.get("currency")
+        print(n, "ok" if cur == "USD" else f"CURRENCY {cur!r}", rec.get("ref"))
+    except ValueError as e:
+        print(n, "TORN", repr(line[:200]), e)
+EOF
+```
+
+**Fix — the operator's call, never automatic.** This file is the record of
+every simulated cost charged. The console nets it off displayed equity and the
+rails net it off rail equity. **Never delete or edit a fee line silently, and
+never "fix" it by emptying the file**: an empty file reads as $0 charged, which
+is exactly the flattering answer the strict reader exists to refuse.
+
+Do it outside 09:00–16:30 ET on a weekday (and not at 17:00, when the backup
+reads `memory/`), or at the weekend. Every job that can charge a fee starts
+inside that window (the 09:35 open cycle, the 15:45 cycle and 15:55 catch-up,
+the :05/:35 swing scans, flatten-retry), and the margin covers a long-running
+cycle, so nothing appends while you work. `tail -3 logs/agent.log` should show
+nothing from the last few minutes.
+
+1. **Unreadable file** (permissions, a directory, a disk error): fix the
+   cause, not the content. The container runs as the host user
+   (`HOST_UID`/`HOST_GID` in `docker-compose.yml`), so the file should belong
+   to that user and be readable; a root-owned file usually means something
+   was run as root against `memory/`. Change nothing inside the file.
+
+2. **A torn or foreign line**: move it, verbatim, into a side file, and leave
+   every other byte alone. `BAD` is the line number from the listing above (if
+   there are several, do the highest number first, so the others keep theirs):
+   ```bash
+   cd ~/bots/repete
+   D=$(date -u +%Y-%m-%d); BAD=<line number>
+   cp -p memory/operator_fees.jsonl memory/operator_fees.jsonl.before-repair-$D
+   sed -n "${BAD}p" memory/operator_fees.jsonl > memory/operator_fees.jsonl.torn-$D
+   sed "${BAD}d" memory/operator_fees.jsonl > memory/operator_fees.jsonl.new
+   diff memory/operator_fees.jsonl memory/operator_fees.jsonl.new   # that one line, nothing else
+   mv memory/operator_fees.jsonl.new memory/operator_fees.jsonl
+   ls -l memory/operator_fees.jsonl                                 # same owner as before
+   ```
+   For a line in another currency, call the side file `.foreign-$D` instead,
+   find out where it came from, and do not convert it to USD by hand.
+
+3. **Re-append what is recoverable, whole.** Print any whole record glued
+   after the torn fragment, in the exact form the bot writes:
+   ```bash
+   .venv/bin/python - memory/operator_fees.jsonl.torn-$D <<'EOF'
+   import json, sys
+   line = open(sys.argv[1]).read().rstrip("\n")
+   for i in range(1, len(line)):
+       if line[i] != "{":
+           continue
+       try:
+           print(json.dumps(json.loads(line[i:]), sort_keys=True))
+           break
+       except ValueError:
+           continue
+   else:
+       print("no whole record after the fragment")
+   EOF
+   ```
+   A whole record found that way is a real cost: append it. A bare fragment
+   (`{… "ref": "close:abc", "fee": 1.0, …`) is recoverable only if its `ref`,
+   `fee` and `ts` are all legible; write it out whole, in the shape of the
+   lines around it, checking the order in the ledger
+   (`grep abc memory/ledger.jsonl`). If the fee itself is cut off, do not
+   guess it: leave it in the side file and say so in step 4. Before appending
+   anything, check its ref is not already there. A duplicate ref is summed by
+   the rails and dropped by the console, so the two would disagree:
+   ```bash
+   grep -c '"ref": "close:abc"' memory/operator_fees.jsonl          # must print 0
+   printf '%s\n' '<the whole record, one line>' >> memory/operator_fees.jsonl
+   ```
+
+4. **Say what you did.** Leave the side files in `memory/`: `scripts/backup.sh`
+   archives the whole directory, so they travel with the evidence. Name them
+   `operator_fees.jsonl.<what>-<date>`, never `*.jsonl`. The restore drill
+   parses every `memory/*.jsonl`, and the console reads only
+   `operator_fees.jsonl`. Then write one event to the ledger (this deploy's
+   store is `jsonl`):
+   ```bash
+   .venv/bin/python -c "import sys; sys.path.insert(0, 'src'); from ledger import Ledger; Ledger('memory/ledger.jsonl').log_event('operator_fee_log_repaired', 'line N moved to memory/operator_fees.jsonl.torn-YYYY-MM-DD; re-appended close:abc (fee 1.0); cause: ...')"
+   ```
+
+**Verify:**
+```bash
+.venv/bin/python -c "import sys; sys.path.insert(0, 'src'); import operator_settings as o; print(o.rail_totals('memory'))"
+docker compose exec agent python src/health.py
+```
+The first prints `(total, total)` and no `FeeLedgerError`. Health stops
+listing "operator fee ledger unreadable" at once. The ENGAGED line stays until
+the next cycle, because health reads the drawdown from the last
+`cycle_complete`, which still says `"rail_equity": null`. The next cycle (09:35
+or 15:45 ET) writes no `rail_equity_unknown` event, records a number in
+`rail_equity`, judges its entries normally, and health returns to `HEALTHY`
+(the container to `healthy`) if nothing else is wrong.
+
+If the newest backup was taken while the bad line was in place, the next
+restore drill fails with `operator_fees.jsonl: archive is not a prefix of live`
+(and unparseable lines). That is this repair, not a new corruption: the
+`.before-repair-` copy and the ledger event explain it, and the next
+`scripts/backup.sh` writes an archive that matches. Keep the older archive;
+it is the evidence.
 
 ---
 

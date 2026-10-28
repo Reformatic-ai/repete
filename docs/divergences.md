@@ -69,7 +69,7 @@ code" is not closed; the repo has been wrong about that before.
 | 23 | **The live kill retires a strategy's entries; the simulator has never modelled it** | **open** | found 2026-08-23; `tests/test_live_kill_is_live_only.py` pins the gap in both directions but does not close it — see the entry |
 | 24 | **The live judge reads a per-symbol research dossier; the simulator models the judge as a distribution and cannot represent one** | **open** | open by construction — registered 2026-08-23 by the change that caused it; the calibration refuses until re-fit |
 | 25 | **The judge is a different model (`qwen3.8-27b`, self-hosted) and no measurement compares it to the one whose record the bot carries** | **open** | open by construction — registered 2026-08-28 by the change that caused it; the shadow baseline needs the vendor that ran out, which is why the switch happened |
-| 26 | **The operator's cost: gates charge a PINNED research block on every fill; live charges the console's current setting, and never on a short's opening order** | **open** | open by construction — registered 2026-10-28 by the change that caused it (the owner's after-cost decision); `tests/test_after_cost_backtest.py` pins the sim side, `tests/test_after_cost_rails.py` the live side |
+| 26 | **The operator's cost: gates charge a PINNED research block on every fill; live charges the console's current setting** (item 2, live never charging a short's opening order, closed 2026-10-28) | **open** | open by construction — registered 2026-10-28 by the change that caused it (the owner's after-cost decision); `tests/test_after_cost_backtest.py` pins the sim side, `tests/test_after_cost_rails.py` the live side; item 2 closed by `tests/test_operator_settings.py` (short opens) |
 
 > **Rows 13–16 were missing from this table until 2026-08-06**, and this is the
 > second time this file has been wrong in the direction that matters. The prose
@@ -1304,9 +1304,9 @@ Live charges every filled order the console's cost model
 (`operator_settings.py`), and since this decision the drawdown, daily-loss and
 live-kill rails and the decay monitor all read results after it. The simulator
 now charges the same formula (`cost_models.order_cost`, the verbatim copy) on
-every simulated fill, so the two agree about **what** a cost is. They do not
+every simulated fill, so the two agree about **what** a cost is. They did not
 agree about **which** cost, in three ways — all deliberate or inherited, none
-hidden:
+hidden. Item 2 closed the same day (2026-10-28); items 1 and 3 stand:
 
 1. **The block.** A gate charges the block pinned in its spec
    (`operator_costs:`; the research values, `cost_models.RECOMMENDED`, written
@@ -1318,12 +1318,30 @@ hidden:
    0032), live pays ~5–9× what the gate assumed, so a gate verdict is
    **optimistic** by the difference — which `operator_cost_paid_usd` on the
    verdict row lets anyone compute.
-2. **Short opens.** `main.record_fill_quality` and adoption charge only
-   `action == "buy"` entries, so live never charges the order that opens a
-   short. The simulator charges every opening order, shorts included.
-   **Direction:** the sim is **pessimistic** for a short leg by one order's
-   cost. Inert today — nothing enabled shorts (xsmom ships `enabled: false`).
-   Recorded as a follow-up for the live side, not fixed here.
+2. **Short opens — CLOSED 2026-10-28.** `main.record_fill_quality` and
+   adoption charged only `action == "buy"` entries, so live never charged the
+   order that opens a short, while the simulator charges every opening order,
+   shorts included. **Direction (while open):** the sim was **pessimistic** for
+   a short leg by one order's cost. Inert — nothing enabled shorts (xsmom ships
+   `enabled: false`). PR #167 recorded it as follow-up 1, and it was closed
+   the same day: both sites now charge every `ENTRY_ACTIONS` entry (`buy` or
+   `short`) with the same model on the broker's filled shares and fill price,
+   under the same entry key, `buy:<trade_id>` (the fee line's `side` says
+   `short`). That is the key `risk.after_cost_trades` joins with the
+   `close:<trade_id>` the cover pays in `handle_close`, so the live kill and
+   the decay monitor see both of a short's costs. The cover's own fill is
+   never charged a second time: a `cover` decision is an exit, and a
+   bracket-leg cover has no decision at all. **Closed by**
+   `tests/test_operator_settings.py`:
+   `test_a_short_then_stop_out_charges_its_open_once_and_its_cover_once` (the
+   real cycle: open, fill confirmed, stop leg covers, a rerun charges
+   nothing), `test_a_short_round_trip_pays_its_open_once_and_its_cover_once`,
+   `test_adopted_long_and_short_each_pay_their_entry_once` (until this it was
+   `test_adopted_long_pays_its_entry_and_short_does_not`, which pinned the
+   gap) and `test_cover_fill_is_not_charged_here`. Not a divergence, and not
+   closed here: the console's exporter lists only `buy` decisions as entry
+   rows, so a short's entry fee comes off the console's displayed equity (it
+   nets the running total) but sits on no transaction row.
 3. **Timing inside a cycle.** Live charges a close the moment it books it, and
    rail equity is computed once per cycle (refreshed after reconcile), so an
    entry later in the same cycle's loop does not see a close charged earlier in

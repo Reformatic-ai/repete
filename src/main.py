@@ -100,8 +100,10 @@ def _charge_operator_fee(cfg: dict | None, ref: str, symbol: str, side: str,
     decision): the RAILS do see it, through that log — rail equity is broker
     equity less the cost charged (_rail_equity), and the live kill and decay
     monitor take each trade's own cost off its P&L. `ref` is the console exporter's
-    transaction key for this order: "buy:<trade_id>" for a filled entry,
-    "close:<trade_id>" for its close. Idempotent on ref. Uses the settings this
+    transaction key for this order: "buy:<trade_id>" for a filled entry (a
+    long's buy or, since 2026-10-28, a short's opening sell — the key names the
+    entry, `side` names the direction), "close:<trade_id>" for its close (a
+    sell or a cover). Idempotent on ref. Uses the settings this
     cycle loaded in _bootstrap_cycle; a cfg without them charges nothing.
 
     `shares` (the filled quantity) and `price` (the fill price) are the order's
@@ -647,9 +649,18 @@ def adopt_untracked_positions(broker, ledger: Ledger, cfg: dict,
             # entry (its fill price). Only when the broker omits that is it
             # market_value / qty above, the current mark — the fill price is
             # then not recorded anywhere.
-            if action == "buy":
-                _charge_operator_fee(cfg, f"buy:{tid}", symbol, "buy", fill_ts,
-                                     shares=qty, price=entry)
+            #
+            # A short pays too (2026-10-28, PR #167 follow-up 1, divergence #26
+            # item 2). This used to be `if action == "buy":`, so an adopted
+            # short's opening order was never charged while the simulator
+            # charges every opening order. Same model, same figures (qty is
+            # already the magnitude), and the same "buy:<tid>" key: that is the
+            # exporter's key for a trade's ENTRY whichever way it points, and
+            # the key risk.after_cost_trades / operator_settings.trade_cost join
+            # with the "close:<tid>" its cover pays in handle_close. `side`
+            # records the real direction ("short").
+            _charge_operator_fee(cfg, f"buy:{tid}", symbol, action, fill_ts,
+                                 shares=qty, price=entry)
             log.warning("Adopted untracked %s position: qty %d @ $%.2f "
                         "(trade %s) — an entry filled but its ledger write was "
                         "lost", symbol, qty, float(entry), tid)
@@ -752,11 +763,20 @@ def record_fill_quality(broker, ledger: Ledger, max_checks: int = 20,
     go-live comparison should use measured costs, not estimates.
     Bounded, idempotent, never raises.
 
-    Also where a BUY entry pays the operator's simulated cost: this is the
+    Also where an ENTRY pays the operator's simulated cost: this is the
     first point the fill is CONFIRMED, so an entry that never fills (written
     off as entry_unfilled — the console shows no row for it) is never charged.
     A written-off entry that fills late anyway is skipped here too: its
-    position comes back as an adopted trade, which pays under its own id."""
+    position comes back as an adopted trade, which pays under its own id.
+
+    An entry is a long's buy OR a short's opening sell (ENTRY_ACTIONS) — since
+    2026-10-28 (PR #167 follow-up 1, divergence #26 item 2); before, only
+    `action == "buy"` paid, so live never charged a short's opening order. Both
+    pay under "buy:<trade_id>", the exporter's key for a trade's entry, so the
+    after-cost join (risk.after_cost_trades) pairs it with "close:<trade_id>".
+    The closing order never pays here: a "sell" or "cover" decision's fill is
+    an EXIT, and handle_close already charged it under the entry's
+    "close:<trade_id>" (a bracket-leg exit has no decision at all)."""
     try:
         records = ledger.all_records()
         have = {r["trade_id"] for r in records if r["type"] == "fill_quality"}
@@ -792,12 +812,14 @@ def record_fill_quality(broker, ledger: Ledger, max_checks: int = 20,
             bps = sign * (fill - signal) / signal * 1e4
             ledger.log_fill_quality(rec["trade_id"], rec["symbol"],
                                     rec["action"], signal, fill, bps)
-            if rec["action"] == "buy" and rec["trade_id"] not in unfilled:
+            if rec["action"] in ENTRY_ACTIONS and rec["trade_id"] not in unfilled:
                 # The broker's filled qty and average fill price. Broker.get_order
                 # always records filled_qty; the decision's ordered qty is the
-                # fallback only for an order record that lacks it.
+                # fallback only for an order record that lacks it. A short's
+                # entry pays exactly as a long's does (see the docstring); `side`
+                # records which it was.
                 _charge_operator_fee(
-                    cfg, f"buy:{rec['trade_id']}", rec["symbol"], "buy",
+                    cfg, f"buy:{rec['trade_id']}", rec["symbol"], rec["action"],
                     o.get("filled_at"),
                     shares=o.get("filled_qty") or rec.get("qty"), price=fill)
     except Exception as e:  # noqa: BLE001 — instrumentation never kills a cycle

@@ -31,8 +31,11 @@ read fresh from the broker). It appends one line per charged order to
 `operator_fees.jsonl` next to the settings file; the console's exporter subtracts the
 running total from the equity it shows and puts each fee on the matching transaction
 (`ref` is that transaction's key in the exporter: "buy:<trade_id>" for a filled entry,
-"close:<trade_id>" for a close). Each line also says how the fee was worked out
-(`settings_schema`, `model`, `gross`, `venue_fee`, `basis`). It is not a fill cost:
+"close:<trade_id>" for a close). The entry key is "buy:" whichever way the trade
+points: since 2026-10-28 a short's opening sell pays under it too (with `side`
+"short"), so a short's two orders join on `ref` exactly as a long's do. Each line also
+says how the fee was worked out (`settings_schema`, `model`, `gross`, `venue_fee`,
+`basis`). It is not a fill cost:
 it never goes into the slippage numbers or sizing, and the outcome record's P&L stays
 the strategy's gross result (the console nets the fee itself).
 

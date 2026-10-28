@@ -101,7 +101,8 @@ src/operator_settings.py Operator settings from the Reformatic console (2026-10-
                  filled shares and fill price and appended per filled order to
                  memory/operator_fees.jsonl under the
                  console exporter's key (buy:<trade_id> where the fill is confirmed in
-                 record_fill_quality or on adoption; close:<trade_id> in handle_close)
+                 record_fill_quality or on adoption — a long's buy or, since
+                 2026-10-28, a short's opening sell; close:<trade_id> in handle_close)
                  — never touches an order, cash, broker equity or sizing, and is NOT
                  a fill cost. Amended 2026-10-28 (owner decision: "Yes: make gates,
                  backtests and the drawdown/retire rails use after-cost results

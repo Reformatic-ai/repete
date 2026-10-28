@@ -1322,8 +1322,9 @@ def simulate_ensemble(sym_bars: dict, cfg: dict, start_cash: float = 100_000.0,
                 # expression for both, because the sign already says which.
                 acct.cash -= signed_qty * fill + fee
                 # The opening order — a buy OR a short — pays the operator's
-                # model (2026-10-28). Live charges only `buy` entries today;
-                # that gap is the live side's, recorded in the PR follow-ups.
+                # model (2026-10-28). Live charges a short's opening order the
+                # same way (main.record_fill_quality and adoption, PR #167
+                # follow-up 1 — divergence #26 item 2, closed 2026-10-28).
                 _op = operator_charge(op_costs, signed_qty, fill, fee)
                 op_paid += _op
                 acct.positions[sym] = {

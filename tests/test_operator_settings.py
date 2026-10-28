@@ -5,7 +5,9 @@ sites in main.py/health.py).
 The promises pinned here:
   * the cost is charged ONCE per filled order, under the console exporter's
     transaction key ("buy:<trade_id>" / "close:<trade_id>"), and never for an
-    entry that did not fill; it changes no order, P&L or rail.
+    entry that did not fill; it changes no order, P&L or rail. Both directions
+    since 2026-10-28 (PR #167 follow-up 1): a short's opening order pays under
+    "buy:<trade_id>" like a long's, and its cover once, under "close:".
     Amended 2026-10-28 (owner decision): "Yes: make gates, backtests and the
     drawdown/retire rails use after-cost results first (repete4's override
     included). Entry cost filters later, bot by bot." It still changes no
@@ -478,15 +480,110 @@ def test_reconciled_stop_out_is_charged_and_unfilled_entry_is_not(env, opdir):
     assert f"close:{unfilled}" not in ops.charged_refs(opdir)
 
 
-def test_adopted_long_pays_its_entry_and_short_does_not(env, opdir):
+def test_adopted_long_and_short_each_pay_their_entry_once(env, opdir):
+    """Until 2026-10-28 this test was `..._and_short_does_not`: it pinned that
+    an adopted short's opening order was never charged, while the simulator
+    charges every opening order (divergence #26 item 2, PR #167 follow-up 1).
+    Now both directions pay under the exporter's ENTRY key, "buy:<tid>", and
+    the fee line's `side` says which way the trade points. A second pass finds
+    both positions tracked and charges nothing more."""
     ledger, _, cfg = env
-    main.adopt_untracked_positions(
-        broker=None, ledger=ledger, cfg=cfg,
-        positions={"SPY": {"qty": 10, "avg_entry": 450.0, "market_value": 4500.0},
-                   "QQQ": {"qty": -5, "avg_entry": 400.0, "market_value": -2000.0}})
+    book = {"SPY": {"qty": 10, "avg_entry": 450.0, "market_value": 4500.0},
+            "QQQ": {"qty": -5, "avg_entry": 400.0, "market_value": -2000.0}}
+    main.adopt_untracked_positions(broker=None, ledger=ledger, cfg=cfg,
+                                   positions=book)
+    main.adopt_untracked_positions(broker=None, ledger=ledger, cfg=cfg,
+                                   positions=book)
     opens = {r["symbol"]: tid for tid, r in ledger.open_buys().items()}
-    assert [(f["ref"], f["symbol"]) for f in _fees(opdir)] == [
-        (f"buy:{opens['SPY']}", "SPY")]
+    assert len(opens) == 2
+    assert sorted((f["ref"], f["symbol"], f["side"], f["fee"])
+                  for f in _fees(opdir)) == sorted([
+        (f"buy:{opens['SPY']}", "SPY", "buy", 9.0),
+        (f"buy:{opens['QQQ']}", "QQQ", "short", 9.0)])
+
+
+# ----------------------------- a short's two orders: the open once, the cover once
+#
+# PR #167 follow-up 1 (closed 2026-10-28): live never charged the order that
+# OPENS a short. Each test here has the long twin above it in this file.
+
+def test_filled_short_open_is_charged_once_under_its_entry_key(tmp_path, opdir):
+    """Twin of test_filled_buy_is_charged_once_under_its_exporter_key."""
+    cfg = _with_settings({}, opdir)
+    led = Ledger(str(tmp_path / "ledger.jsonl"))
+    tid = _buy(led, action="short")
+    broker = FillBroker({"o-1": {"filled_avg_price": 99.9,
+                                 "filled_at": "2026-10-28T13:30:01Z"}})
+    main.record_fill_quality(broker, led, cfg=cfg)
+    main.record_fill_quality(broker, led, cfg=cfg)
+    fees = _fees(opdir)
+    assert [(f["ref"], f["side"], f["market"], f["fee"]) for f in fees] == [
+        (f"buy:{tid}", "short", "equities", 9.0)]
+    assert fees[0]["ts"] == "2026-10-28T13:30:01+00:00"
+
+
+def test_unfilled_short_open_is_not_charged(tmp_path, opdir):
+    cfg = _with_settings({}, opdir)
+    led = Ledger(str(tmp_path / "ledger.jsonl"))
+    _buy(led, action="short")
+    main.record_fill_quality(FillBroker({"o-1": {"filled_avg_price": None}}),
+                             led, cfg=cfg)
+    assert _fees(opdir) == []
+
+
+def test_written_off_short_that_fills_late_is_not_charged(tmp_path, opdir):
+    """As for a long: a late fill comes back as an adopted trade under a NEW id
+    and pays there, so the written-off id must not pay as well."""
+    cfg = _with_settings({}, opdir)
+    led = Ledger(str(tmp_path / "ledger.jsonl"))
+    tid = _buy(led, action="short")
+    led.close_trade(tid, 100.0, 0.0, 0.0, exit_reason="entry_unfilled")
+    main.record_fill_quality(FillBroker({"o-1": {"filled_avg_price": 100.0}}),
+                             led, cfg=cfg)
+    assert _fees(opdir) == []
+
+
+def test_cover_fill_is_not_charged_here(tmp_path, opdir):
+    """Twin of test_sell_fill_is_not_charged_here. The cover is the short's
+    closing BUY; it pays in handle_close under close:<short trade id>, so the
+    cover decision's own fill must not pay a second time — widening the entry
+    charge to ENTRY_ACTIONS must not have reached the exit side."""
+    cfg = _with_settings({}, opdir)
+    led = Ledger(str(tmp_path / "ledger.jsonl"))
+    _buy(led, order_id="o-2", action="cover")
+    main.record_fill_quality(FillBroker({"o-2": {"filled_avg_price": 99.0}}),
+                             led, cfg=cfg)
+    assert _fees(opdir) == []
+
+
+def test_a_short_round_trip_pays_its_open_once_and_its_cover_once(env, opdir):
+    """A strategy-closed short, in the order the cycle sees it: the entry fill
+    confirmed (twice, as two cycles would), then the cover decision booked and
+    handle_close charging the close, then the cover decision's own fill
+    confirmed (twice). Exactly two lines come out, one per order, and the
+    after-cost join puts both on the one trade. (handle_close's own replay
+    guard is test_close_site_charges_the_exit_qty_and_exit_price[short].)"""
+    ledger, memory, cfg = env
+    tid = _buy(ledger, order_id="o-1", action="short")       # 10 @ $100
+    rec = ledger.open_buys()[tid]
+    broker = FillBroker({"o-1": {"filled_avg_price": 100.0, "filled_qty": 10,
+                                 "filled_at": "2026-10-28T13:30:01Z"},
+                         "o-2": {"filled_avg_price": 90.0, "filled_qty": 10}})
+    for _ in range(2):
+        main.record_fill_quality(broker, ledger, cfg=cfg)
+    cover = _buy(ledger, order_id="o-2", action="cover")
+    main.handle_close(tid, rec, 90.0, ledger, memory, cfg)
+    for _ in range(2):
+        main.record_fill_quality(broker, ledger, cfg=cfg)
+    assert [(f["ref"], f["side"], f["fee"]) for f in _fees(opdir)] == [
+        (f"buy:{tid}", "short", 9.0), (f"close:{tid}", "cover", 9.0)]
+    assert f"buy:{cover}" not in ops.charged_refs(opdir)
+    fees = ops.fees_by_ref(opdir)
+    assert ops.trade_cost(fees, tid) == 18.0
+    import risk
+    [t] = risk.after_cost_trades(ledger.closed_trades(), fees)
+    assert t["pnl_gross"] == pytest.approx(100.0)            # (100 - 90) x 10
+    assert t["pnl"] == pytest.approx(100.0 - 18.0)
 
 
 # ----------------------------------------- end to end: refs == exporter keys
@@ -549,6 +646,67 @@ def test_a_buy_then_stop_out_charges_exactly_the_exporter_rows(cycle_env, opdir)
     assert len(refs) == len(set(refs)) == 2
     assert set(refs) == _exporter_keys(cfg["memory"]["ledger_path"])
     assert ops.total(opdir) == 18.0
+
+
+def _scripted_signal(monkeypatch, action):
+    """Every strategy says `action` for a flat symbol and holds a held one —
+    the tests/test_short_path.py way of making the real cycle open a short
+    (nothing shipped emits one: xsmom is `enabled: false`)."""
+    import strategies
+    from strategies.base import Signal
+
+    def _scripted(name, symbol, bars, cfg_, holding, cross_section=None,
+                  entry_ts=None, position_side=None):
+        if action is None or holding:
+            return Signal(symbol, "hold", "scripted hold", {}, name)
+        return Signal(symbol, action, f"scripted {action}", {}, name)
+    monkeypatch.setattr(strategies, "generate", _scripted)
+
+
+def test_a_short_then_stop_out_charges_its_open_once_and_its_cover_once(
+        cycle_env, opdir, monkeypatch):
+    """The short twin of test_a_buy_then_stop_out_charges_exactly_the_exporter_
+    rows, through the real cycle. Cycle 1 opens a 50-share short @ $20 (a SELL
+    bracket). Cycle 2 confirms the entry fill (record_fill_quality, in
+    bootstrap) and finds the stop leg filled — the covering BUY — through
+    reconcile. Cycle 3 sees the same broker again and charges nothing.
+
+    Not compared with _exporter_keys: the console's exporter lists only
+    `action == "buy"` decisions as entry rows today, so a short's entry fee sits
+    on no row there (it still comes off displayed equity, which nets the
+    running total). What this pins is the join the RAILS use."""
+    cfg, install = cycle_env
+    _write_settings(opdir)
+    _scripted_signal(monkeypatch, "short")
+    broker = install(FakeCycleBroker(make_bars(BUY_CLOSES)))
+    main.run_cycle()
+    assert [c.get("side") for c in broker.bracket_calls] == ["short"]
+    assert _fees(opdir) == []           # placed, not yet known to have filled
+    [tid] = Ledger(cfg["memory"]["ledger_path"]).open_buys()
+
+    _scripted_signal(monkeypatch, None)
+    orders = {
+        "entry-1": FILLED_ENTRY,
+        "leg-stop": {"id": "leg-stop", "status": "OrderStatus.FILLED",
+                     "type": "OrderType.STOP", "filled_avg_price": 27.33,
+                     "filled_qty": 50, "legs": []},
+        "leg-tp": {"id": "leg-tp", "status": "OrderStatus.CANCELED",
+                   "type": "OrderType.LIMIT", "filled_avg_price": None,
+                   "filled_qty": 0, "legs": []}}
+    for _ in range(2):
+        install(FakeCycleBroker(make_bars(BUY_CLOSES + [20], start_day=2),
+                                positions={}, orders=orders))
+        main.run_cycle()
+
+    assert [(f["ref"], f["side"], f["fee"]) for f in _fees(opdir)] == [
+        (f"buy:{tid}", "short", 9.0), (f"close:{tid}", "cover", 9.0)]
+    import risk
+    [t] = risk.after_cost_trades(
+        Ledger(cfg["memory"]["ledger_path"]).closed_trades(),
+        ops.fees_by_ref(opdir))
+    assert (t["trade_id"], t["action"]) == (tid, "short")
+    assert t["pnl_gross"] == pytest.approx(-(27.33 - 20.0) * 50)
+    assert t["pnl"] == pytest.approx(-(27.33 - 20.0) * 50 - 18.0)
 
 
 def test_an_entry_that_never_fills_charges_nothing(cycle_env, opdir):
@@ -851,6 +1009,26 @@ def test_adopted_position_site_charges_the_broker_position(env, opdir, shares,
                            "market_value": shares * price * 1.1}})
     [f] = _fees(opdir)
     assert f["ref"].startswith("buy:") and f["fee"] == pytest.approx(want)
+    assert (f["basis"]["shares"], f["basis"]["notional"]) == (shares,
+                                                              shares * price)
+
+
+@pytest.mark.parametrize("shares,price,want", EQUITY_REFERENCE)
+def test_adopted_short_site_charges_the_broker_position(env, opdir, shares,
+                                                        price, want):
+    """Twin of the test above for a short: the broker reports qty and market
+    value NEGATIVE; the charge sees the magnitude and the average entry, the
+    same reference amounts, under the same entry key."""
+    ledger, _, cfg = env
+    cfg = ops.to_cfg(cfg, _load_v2(opdir))
+    main.adopt_untracked_positions(
+        broker=None, ledger=ledger, cfg=cfg,
+        positions={"SPY": {"qty": -shares, "avg_entry": price,
+                           "market_value": -shares * price * 1.1}})
+    [tid] = ledger.open_buys()
+    [f] = _fees(opdir)
+    assert (f["ref"], f["side"]) == (f"buy:{tid}", "short")
+    assert f["fee"] == pytest.approx(want)
     assert (f["basis"]["shares"], f["basis"]["notional"]) == (shares,
                                                               shares * price)
 
