@@ -229,7 +229,7 @@ def check(today: date | None = None,
     if dd.get("engaged"):
         problems.append(f"drawdown circuit breaker ENGAGED — {_latch_detail(dd)}"
                         f". Entries are blocked; exits still run. "
-                        f"{_reset_hint()}")
+                        f"{_reset_hint(dd)}")
 
     # The judge's endpoint, only when a config was passed (main() passes the
     # real one; tests that predate this parameter keep their no-network
@@ -257,10 +257,12 @@ def _latch_detail(dd: dict) -> str:
             f"(limit {dd['limit_pct']:.1f}%)")
 
 
-def _reset_hint() -> str:
+def _reset_hint(dd: dict | None = None) -> str:
+    """risk.drawdown_hint: the peak reset for a real drawdown, the fee-log
+    runbook when rail equity is unknown (2026-10-28, PR #168)."""
     try:
         import risk
-        return risk.HIGHWATER_RESET_HINT
+        return risk.drawdown_hint(dd or {})
     except Exception:  # noqa: BLE001 — a missing hint must not break the check
         return "the peak only ratchets UP, so this cannot clear itself."
 

@@ -497,7 +497,7 @@ def drawdown_state(equity: float | None, limit_pct: float, *,
            "drawdown_pct": None, "limit_pct": float(limit_pct or 0),
            "headroom_pp": None, "note": "",
            "basis": None, "rail_equity": None, "peak_equity_gross": None,
-           "drawdown_gross_pct": None}
+           "drawdown_gross_pct": None, "rail_equity_unknown": False}
     if rail_equity is _SAME_AS_EQUITY:
         rail_equity = equity
 
@@ -536,6 +536,9 @@ def drawdown_state(equity: float | None, limit_pct: float, *,
             # The fee ledger is unreadable, so after-cost equity is unknown. The
             # live rail fails CLOSED on exactly this, and so does the report.
             out["engaged"] = True
+            # Flagged so drawdown_hint() can tell this from a real drawdown:
+            # the peak reset that clears a real one is the wrong advice here.
+            out["rail_equity_unknown"] = True
             out["note"] = ("operator fee ledger unreadable — rail equity "
                            "unknown, the rail fails CLOSED"
                            + (f" ({rail_problem})" if rail_problem else ""))
@@ -559,6 +562,27 @@ def drawdown_state(equity: float | None, limit_pct: float, *,
 HIGHWATER_RESET_HINT = (
     f"the peak only ratchets UP, so this cannot clear itself — see §40. "
     f"To reset after reviewing: rm {_HIGHWATER_FILE}")
+
+# What to say instead when the rail is ENGAGED only because rail equity is
+# unknown (2026-10-28, PR #168). That is not a drawdown: the operator fee log
+# cannot be read strictly, the rail fails CLOSED, and it clears by itself at
+# the first cycle that reads the log again. Printing the peak reset there would
+# invite an operator to forgive a drawdown nobody reviewed, to fix a file.
+RAIL_EQUITY_UNKNOWN_HINT = (
+    "This is not a drawdown: the operator fee log cannot be read strictly, so "
+    "the rail fails CLOSED until it can. Do NOT reset the peak for it; repair "
+    "the fee log as docs/runbooks.md describes under \"rail_equity_unknown\", "
+    "and the next cycle clears it.")
+
+
+def drawdown_hint(state: dict) -> str:
+    """The advice that goes with an ENGAGED drawdown rail (`drawdown_state`'s
+    output). The peak reset for a real drawdown; the fee-log runbook when the
+    rail is engaged only because rail equity is unknown. Shared by health.py
+    and watchdog.py so the status line and the alert give the same advice."""
+    if (state or {}).get("rail_equity_unknown"):
+        return RAIL_EQUITY_UNKNOWN_HINT
+    return HIGHWATER_RESET_HINT
 
 
 def decay_clock(prev_trough: float | None, prev_bars: int,

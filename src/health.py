@@ -513,6 +513,10 @@ def status(cfg: dict | None = None, now: datetime | None = None,
     # §40: the latch has no recovery path, so this problem is permanent until
     # a human acts. Saying only "entries blocked" would read as a transient
     # state that clears itself — the whole point is that it does not.
+    # The one exception (2026-10-28, PR #168): ENGAGED only because rail equity
+    # is unknown (the fee log cannot be read strictly) DOES clear itself once
+    # the log reads, so it gets the runbook pointer, never the peak reset
+    # (risk.drawdown_hint).
     dd = out["drawdown"]
     if dd and dd.get("engaged"):
         detail = (f"{dd['drawdown_pct']:.2f}% from peak "
@@ -520,16 +524,18 @@ def status(cfg: dict | None = None, now: datetime | None = None,
                   if dd.get("drawdown_pct") is not None else dd.get("note", ""))
         out["problems"].append(
             f"drawdown circuit breaker ENGAGED — {detail}; entries are "
-            f"blocked and exits still run. " + _reset_hint())
+            f"blocked and exits still run. " + _reset_hint(dd))
 
     out["healthy"] = not out["problems"]
     return out
 
 
-def _reset_hint() -> str:
+def _reset_hint(dd: dict | None = None) -> str:
+    """risk.drawdown_hint: the peak reset for a real drawdown, the fee-log
+    runbook when rail equity is unknown (2026-10-28, PR #168)."""
     try:
         import risk
-        return risk.HIGHWATER_RESET_HINT
+        return risk.drawdown_hint(dd or {})
     except Exception:  # noqa: BLE001 — a missing hint must not break the check
         return "the peak only ratchets UP, so this cannot clear itself."
 

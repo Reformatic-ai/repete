@@ -226,10 +226,13 @@ and "drawdown circuit breaker ENGAGED — operator fee ledger unreadable …".
 each close is still charged its fee. The weekly decay check exits 2 ("could
 not run") while it lasts.
 
-**Read this first: do NOT follow the `rm memory/.equity_highwater.json` hint**
-that health prints after the ENGAGED line. That hint belongs to a real
-drawdown. This one is not a drawdown and clears itself once the fee log reads;
-removing the peak would forgive a drawdown nobody reviewed.
+**Read this first: do NOT reset the peak for this.** It is not a drawdown,
+and it clears itself once the fee log reads; removing
+`memory/.equity_highwater.json` would forgive a drawdown nobody reviewed.
+Health and the watchdog say so on the ENGAGED line ("This is not a drawdown
+… Do NOT reset the peak for it", `risk.drawdown_hint`). A build older than
+PR #168 printed the real-drawdown reset hint (`rm …`) here instead; ignore
+it if you see it.
 
 **Why it fails closed:** since 2026-10-28 (owner decision, §80) the drawdown,
 daily-loss and live-kill rails read **rail equity** = broker equity minus every

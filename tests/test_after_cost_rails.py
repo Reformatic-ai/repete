@@ -34,6 +34,7 @@ import main
 import operator_settings as ops
 import randombaseline as rb
 import risk
+import watchdog
 from conftest import make_bars
 from ledger import Ledger
 from test_main_cycle import BUY_CLOSES, FakeCycleBroker
@@ -560,6 +561,88 @@ def test_health_reports_a_torn_ledger_as_a_problem_and_the_rail_engaged(
     assert "fails CLOSED" in s["drawdown"]["note"]
     assert any("fee ledger unreadable" in p for p in s["problems"])
     assert s["healthy"] is False
+
+
+# ---------------- the advice: a fee-log problem is not a drawdown (PR #168)
+#
+# Health and the watchdog append advice to the ENGAGED line. For a real
+# drawdown it is the peak reset (§40: the latch cannot clear itself). When the
+# rail is engaged only because rail equity is unknown, that advice is wrong and
+# harmful: the state clears itself once the fee log reads, and removing the
+# peak would forgive a drawdown nobody reviewed. Each test checks BOTH callers.
+
+def _advice_env(tmp_path, monkeypatch, opdir, detail, fee_lines=()):
+    monkeypatch.chdir(tmp_path)
+    risk.update_high_water(100_000.0)                 # after-cost basis
+    rec = {"type": "event", "event": "cycle_complete",
+           "ts": "2026-10-28T20:00:00+00:00", "detail": json.dumps(detail)}
+    with open(os.path.join("memory", "ledger.jsonl"), "w") as f:
+        f.write(json.dumps(rec) + "\n")
+    cfg = {"memory": {"ledger_path": "memory/ledger.jsonl"}, "mode": "paper",
+           "risk": {"max_drawdown_pct": 10.0}}
+    with open("config.yaml", "w") as f:                # what the watchdog reads
+        yaml.safe_dump(cfg, f)
+    if fee_lines:
+        _ledger(opdir, *fee_lines)
+    return cfg, [rec]
+
+
+def _engaged_lines(cfg, recs):
+    """The ENGAGED problem from health.status and from watchdog.check."""
+    out = []
+    for problems in (health.status(cfg=cfg, read_only=True)["problems"],
+                     watchdog.check(records=recs)):
+        hits = [p for p in problems if "circuit breaker ENGAGED" in p]
+        assert len(hits) == 1, problems
+        out.append(hits[0])
+    return out
+
+
+@pytest.mark.parametrize("detail,fee_lines", [
+    # the last cycle could not read the fee log and recorded rail_equity null
+    ({"equity": 99_000.0, "rail_equity": None}, ()),
+    # a cycle_complete that predates the field, and a fee log torn NOW
+    ({"equity": 99_000.0}, (TORN,)),
+], ids=["last_cycle_failed_closed", "torn_log_now"])
+def test_unknown_rail_equity_points_to_the_runbook_not_the_peak_reset(
+        tmp_path, monkeypatch, opdir, detail, fee_lines):
+    cfg, recs = _advice_env(tmp_path, monkeypatch, opdir, detail, fee_lines)
+    for line in _engaged_lines(cfg, recs):
+        assert "operator fee ledger unreadable" in line
+        assert risk.RAIL_EQUITY_UNKNOWN_HINT in line
+        assert "docs/runbooks.md" in line and "rail_equity_unknown" in line
+        assert risk.HIGHWATER_RESET_HINT not in line
+        assert "rm " not in line and ".equity_highwater.json" not in line
+        assert "cannot clear itself" not in line
+
+
+def test_a_genuine_after_cost_drawdown_keeps_the_peak_reset_hint(
+        tmp_path, monkeypatch, opdir):
+    """The pair of the test above: same fixture, a readable fee log and a real
+    15% drawdown after cost. The §40 reset advice must still be there, and the
+    fee-log pointer must not."""
+    cfg, recs = _advice_env(tmp_path, monkeypatch, opdir,
+                            {"equity": 85_100.0, "rail_equity": 85_000.0},
+                            (_line("buy:old", 9.0),))
+    for line in _engaged_lines(cfg, recs):
+        assert "15.00% from peak" in line
+        assert risk.HIGHWATER_RESET_HINT in line
+        assert "cannot clear itself" in line and ".equity_highwater.json" in line
+        assert risk.RAIL_EQUITY_UNKNOWN_HINT not in line
+        assert "rail_equity_unknown" not in line
+
+
+def test_drawdown_hint_follows_the_state_flag():
+    assert risk.drawdown_hint({"engaged": True}) == risk.HIGHWATER_RESET_HINT
+    assert risk.drawdown_hint({}) == risk.HIGHWATER_RESET_HINT
+    assert risk.drawdown_hint({"engaged": True, "rail_equity_unknown": True}) \
+        == risk.RAIL_EQUITY_UNKNOWN_HINT
+
+
+def test_the_hint_names_a_runbook_entry_that_exists():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(risk.__file__)))
+    with open(os.path.join(root, "docs", "runbooks.md")) as f:
+        assert "\n## rail_equity_unknown " in f.read()
 
 
 # ------------------------------------------------- the decay monitor
