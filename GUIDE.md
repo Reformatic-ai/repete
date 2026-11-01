@@ -56,7 +56,7 @@ The video's architecture puts the LLM in charge. The research says that's backwa
 ## Step 1 — Install the basics (~20 min)
 
 1. **Install Python 3.11+**: from [python.org](https://www.python.org/downloads/) (check "Add to PATH" on Windows) or `brew install python` on Mac.
-2. **Get the project onto your machine**: `git clone https://github.com/connorshibley/repete.git ~/repete` (this said "unzip `trading-agent.zip`" until 2026-07-29 — it was a zip once and has been a public git repo since; the repo was named `trading-agent` until 2026-08-23, and GitHub redirects the old URL).
+2. **Get the project onto your machine**: `git clone https://github.com/Reformatic-ai/repete.git ~/repete` (this said "unzip `trading-agent.zip`" until 2026-07-29 — it was a zip once and has been a public git repo since; the repo was named `trading-agent` until 2026-08-23, and GitHub redirects the old URL).
 3. **Open a terminal in that folder** and create a virtual environment:
    ```bash
    python3 -m venv venv

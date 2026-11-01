@@ -55,7 +55,7 @@ def test_add_entry_never_raises(cfg, monkeypatch):
 
 
 def test_post_text_link_uses_tco_math(cfg, capsys):
-    long_url = "https://connorshibley.github.io/repete-dashboard/journal.html#abc12345"
+    long_url = "https://reformatic-ai.github.io/repete-dashboard/journal.html#abc12345"
     text = "[PAPER] " + "x" * 240  # 248 chars — no room for a raw URL
     x_poster.post_text(text, cfg, link=long_url)
     out = capsys.readouterr().out

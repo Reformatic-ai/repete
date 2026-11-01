@@ -71,7 +71,7 @@ flyctl ssh console -C "python src/health.py"
 On any small Linux box with Docker installed:
 
 ```bash
-git clone https://github.com/connorshibley/repete.git
+git clone https://github.com/Reformatic-ai/repete.git
 cd repete
 cp .env.example .env && $EDITOR .env        # fill in keys; stays out of git
 sh deploy/deploy.sh                          # build, start, verify

@@ -198,7 +198,7 @@ src/dashboard.py Self-contained dashboard.html — dark terminal theme, hero tot
                  calibration, slippage; vanilla inline JS only (tooltips/count-up/filters).
                  Regenerated at every scheduled
                  touchpoint and published with journal.html via scripts/publish_dashboard.sh
-                 to https://connorshibley.github.io/repete-dashboard/ (public repo).
+                 to https://reformatic-ai.github.io/repete-dashboard/ (public repo).
                  Both the laptop (run_cycle.sh) and container (scheduler.py chains the
                  publish after the cycle/posts) paths push; publish is a clean no-op
                  without a .site/.git checkout + push creds.
